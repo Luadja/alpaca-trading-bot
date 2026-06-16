@@ -4,24 +4,49 @@ captured by systemd/journald or Docker when you eventually deploy.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 _CONFIGURED = False
 
 
-def setup_logging(level: int = logging.INFO, log_file: str = "logs/bot.log") -> logging.Logger:
+class _JsonFormatter(logging.Formatter):
+    """One JSON object per line — parseable by Loki/CloudWatch/etc."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        out = {
+            "ts": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            out["exc"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            out["stack"] = self.formatStack(record.stack_info)
+        return json.dumps(out)
+
+
+def setup_logging(
+    level: int = logging.INFO, log_file: str = "logs/bot.log", json_format: bool = False
+) -> logging.Logger:
     global _CONFIGURED
     logger = logging.getLogger("bot")
     if _CONFIGURED:
         return logger
 
     logger.setLevel(level)
-    fmt = logging.Formatter(
-        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    fmt: logging.Formatter = (
+        _JsonFormatter()
+        if json_format
+        else logging.Formatter(
+            "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     )
 
     stream = logging.StreamHandler(sys.stdout)

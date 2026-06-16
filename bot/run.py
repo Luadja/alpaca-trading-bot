@@ -25,9 +25,11 @@ from datetime import date, datetime
 
 from alpaca.trading.enums import OrderSide
 
+from bot.alerting import alerter_from_settings
 from bot.config import Settings, load_settings
 from bot.data.historical import HistoricalData, parse_timeframe
 from bot.execution.broker import Broker
+from bot.heartbeat import write_heartbeat
 from bot.logging_setup import setup_logging
 from bot.models import SignalDecision, SignalType
 from bot.risk import RiskConfig, RiskManager
@@ -66,6 +68,7 @@ class TradingBot:
         self.data = HistoricalData(settings)
         self.strategy = make_strategy(settings.strategy)
         self.ledger = Ledger(settings.ledger_path)
+        self.alerter = alerter_from_settings(settings)
         self.timeframe = parse_timeframe(settings.timeframe)
 
         account = self.broker.account()
@@ -75,8 +78,14 @@ class TradingBot:
             "Started. equity=%.2f paper=%s strategy=%s halted=%s",
             account.equity, settings.paper, settings.strategy, self.risk.halted,
         )
+        if self.risk.halted:
+            self.alerter.notify("critical", "started with kill switch HALTED", "rehydrated from prior session")
+        self._write_heartbeat(account.equity)  # liveness from the first moment
 
     def step(self) -> None:
+        # Liveness first, so the heartbeat stays fresh even on the early returns below
+        # (closed market, kill switch) and across the market-open boundary.
+        self._write_heartbeat()
         # Don't poll/submit into a closed market (TIF=DAY would silently drop orders).
         if not self.broker.is_market_open():
             self.log.info("Market closed — skipping cycle.")
@@ -97,10 +106,10 @@ class TradingBot:
             if halted:
                 self.broker.flatten_all()
         if halted:
-            self.log.warning(
-                "KILL SWITCH active (daily P&L %.2f%%) — flattened, no new entries.",
-                self.risk.daily_pnl_pct(account.equity) * 100,
-            )
+            pnl = self.risk.daily_pnl_pct(account.equity) * 100
+            self.log.warning("KILL SWITCH active (daily P&L %.2f%%) — flattened, no new entries.", pnl)
+            self.alerter.notify("critical", "kill switch tripped — account flattened", f"daily P&L {pnl:.2f}%")
+            self._write_heartbeat(account.equity)
             return
 
         # Catastrophic stop: flatten any managed position past the hard stop, before signals.
@@ -119,8 +128,11 @@ class TradingBot:
                 running_exposure = self._evaluate_symbol(
                     symbol, account.equity, positions, running_exposure
                 )
-            except Exception:  # one bad symbol shouldn't take down the loop
+            except Exception as exc:  # one bad symbol shouldn't take down the loop
                 self.log.exception("error evaluating %s", symbol)
+                self.alerter.notify("warning", f"error evaluating {symbol}", str(exc))
+
+        self._write_heartbeat(account.equity)
 
     def _enforce_stops(self, positions_raw, positions: dict) -> set:
         """Hard catastrophic stop on managed positions, using the broker's own entry and
@@ -132,10 +144,12 @@ class TradingBot:
                 continue
             entry, price = float(p.avg_entry_price), float(p.current_price)
             if self.risk.should_stop_out(entry, price):
+                pct = (price / entry - 1) * 100 if entry else 0.0
                 self.log.warning(
                     "%s: CATASTROPHIC STOP (entry %.2f, price %.2f, %.1f%%) — flattening",
-                    p.symbol, entry, price, (price / entry - 1) * 100 if entry else 0.0,
+                    p.symbol, entry, price, pct,
                 )
+                self.alerter.notify("warning", f"catastrophic stop: {p.symbol}", f"{pct:.1f}% from entry")
                 self.broker.close_position(p.symbol)
                 stopped.add(p.symbol)
                 positions[p.symbol] = 0.0
@@ -217,6 +231,7 @@ class TradingBot:
             if status in terminal:
                 if status != "filled":
                     self.log.warning("%s: order %s — filled %s", coid, status, filled)
+                    self.alerter.notify("warning", f"order {status}", f"{coid} filled {filled}")
                 return filled
             if attempt < tries - 1:
                 time.sleep(pause)
@@ -301,6 +316,7 @@ class TradingBot:
         """Fast, independent equity check so the kill switch trips between trade cycles.
         The update + flatten run under the lock, mutually exclusive with entry submission."""
         try:
+            self._write_heartbeat()  # refresh liveness even if step() is slow/wedged
             if not self.broker.is_market_open():
                 return
             equity = self.broker.account().equity  # network read, outside the lock
@@ -310,12 +326,23 @@ class TradingBot:
                 if halted:
                     self.broker.flatten_all()
             if halted:
-                self.log.warning(
-                    "SAFETY POLL kill switch (daily P&L %.2f%%) — flattened",
-                    self.risk.daily_pnl_pct(equity) * 100,
-                )
+                pnl = self.risk.daily_pnl_pct(equity) * 100
+                self.log.warning("SAFETY POLL kill switch (daily P&L %.2f%%) — flattened", pnl)
+                self.alerter.notify("critical", "kill switch tripped (safety poll) — flattened", f"daily P&L {pnl:.2f}%")
+            self._write_heartbeat(equity)
         except Exception:
             self.log.exception("safety poll error")
+
+    def _write_heartbeat(self, equity: float | None = None) -> None:
+        payload = {"halted": self.risk.halted, "strategy": self.settings.strategy}
+        if equity is not None:
+            payload["equity"] = equity
+        try:
+            write_heartbeat(self.settings.heartbeat_path, payload)
+        except Exception as exc:  # heartbeat write must never break the cycle
+            self.log.exception("heartbeat write failed")
+            # A persistent write failure makes the watchdog flatten; surface the root cause.
+            self.alerter.notify("warning", "heartbeat write failed", str(exc))
 
     @staticmethod
     def _coid(symbol: str, side: str, bar_ts) -> str:

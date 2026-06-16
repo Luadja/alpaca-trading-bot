@@ -36,8 +36,17 @@ class Settings(BaseSettings):
     # silently invalidate the regime gate — this is just a lower bound.
     warmup_bars: int = 220
 
-    # Local SQLite ledger path.
+    # Local SQLite ledger path + liveness heartbeat (read by the watchdog).
     ledger_path: str = "data/ledger.sqlite"
+    heartbeat_path: str = "data/heartbeat.json"
+
+    # Alerting (all optional — unset = log-only). Slack incoming webhook and/or SMTP email.
+    alert_slack_webhook: str = Field(default="", validation_alias="ALERT_SLACK_WEBHOOK")
+    alert_email_to: str = Field(default="", validation_alias="ALERT_EMAIL_TO")
+    smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, validation_alias="SMTP_PORT")
+    smtp_user: str = Field(default="", validation_alias="SMTP_USER")
+    smtp_password: str = Field(default="", validation_alias="SMTP_PASSWORD")
 
     def assert_keys(self) -> None:
         if not self.api_key or not self.api_secret:

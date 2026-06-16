@@ -32,9 +32,12 @@ any live capital.**
 > / partial fills recorded (1.4), retry/backoff + idempotent submit with a lost-response
 > fallback (1.5), and the kill switch is now multi-horizon (daily/weekly/monthly, per-horizon
 > latch), persisted across restarts, with an independent fast safety-poll and a trade lock
-> closing the kill↔submit race. Market-clock gate (§4) is in. **Reviewed adversarially**
-> (3 high-sev bugs found and fixed). Remaining Tier 0: monitoring/alerting + watchdog (§4),
-> and the research gates (survivorship-free universe, realistic costs, go-live gate; §5).
+> closing the kill↔submit race. Market-clock gate (§4) is in. ✅ **§4 observability done**:
+> alerting (`bot/alerting.py`, Slack/email, log-only when unconfigured), a liveness
+> heartbeat (`bot/heartbeat.py`), and an independent **dead-man's-switch watchdog**
+> (`scripts/watchdog.py`) that flattens on a stale heartbeat — both batches **reviewed
+> adversarially** (high-sev bugs found and fixed each time). Remaining Tier 0: the research
+> gates (survivorship-free universe, realistic costs, go-live gate; §5).
 
 | # | Gap | Where | Fix | Sev |
 |---|---|---|---|---|
