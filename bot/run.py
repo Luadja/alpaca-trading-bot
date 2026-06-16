@@ -88,9 +88,14 @@ class TradingBot:
                 self.log.exception("error evaluating %s", symbol)
 
     def _evaluate_symbol(self, symbol, equity, positions, running_exposure) -> float:
-        df = self.data.get_bars(symbol, self.timeframe, lookback_days=400, use_cache=False)
-        if df.empty or len(df) < self.settings.warmup_bars:
-            self.log.info("%s: not enough bars (%d)", symbol, len(df))
+        df = self.data.get_bars(symbol, self.timeframe, lookback_days=500, use_cache=False)
+        required = max(self.settings.warmup_bars, self.strategy.params.min_bars)
+        if df.empty or len(df) < required:
+            self.log.warning(
+                "%s: insufficient history %d/%d bars — skipping (the symbol will not trade "
+                "until it has enough; the trend-filter SMA needs the full window)",
+                symbol, len(df), required,
+            )
             return running_exposure
 
         bar_ts = df.index[-1]

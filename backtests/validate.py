@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import warnings
 
 import numpy as np
@@ -52,7 +53,7 @@ REGIMES = [
 ]
 
 HEADER = (
-    f"{'window / config':<28} {'ret%':>7} {'sharpe':>7} {'trades':>7} "
+    f"{'window / config':<34} {'ret%':>7} {'sharpe':>7} {'trades':>7} "
     f"{'win%':>6} {'maxdd%':>7} {'beatBH%':>8} {'n':>3}"
 )
 
@@ -102,7 +103,7 @@ def _aggregate(records: list[dict]) -> dict:
 def _row(label: str, m: dict) -> str:
     win = f"{m['win']:.0f}" if not np.isnan(m["win"]) else "-"
     return (
-        f"{label:<28} {m['ret']:>7.1f} {m['sharpe']:>7.2f} {m['trades']:>7.1f} "
+        f"{label:<34} {m['ret']:>7.1f} {m['sharpe']:>7.2f} {m['trades']:>7.1f} "
         f"{win:>6} {m['dd']:>7.1f} {m['beat']:>8.0f} {m['n']:>3}"
     )
 
@@ -120,6 +121,8 @@ def main() -> None:
         help="min avg in-sample trades for a param set to be eligible as 'best' "
         "(ranking by Sharpe alone rewards configs that barely trade)",
     )
+    ap.add_argument("--trend-filter", action="store_true", help="enable the price>SMA trend filter")
+    ap.add_argument("--trend-sma", type=int, default=200)
     args = ap.parse_args()
 
     settings = load_settings()
@@ -151,7 +154,13 @@ def main() -> None:
     print(f"In-sample: {is_start} -> {is_end}  |  Out-of-sample: {oos_start} -> now\n")
 
     grid = build_grid()
-    default_p = StochRsiMfiParams()  # current shipped default
+    # Baseline is the raw oscillator (filter OFF), independent of the shipped default;
+    # --trend-filter flips it ON across the whole experiment.
+    default_p = StochRsiMfiParams(use_trend_filter=False)
+    if args.trend_filter:
+        grid = [dataclasses.replace(p, use_trend_filter=True, trend_sma=args.trend_sma) for p in grid]
+        default_p = dataclasses.replace(default_p, use_trend_filter=True, trend_sma=args.trend_sma)
+        print(f"Trend filter ON: longs only when price > {args.trend_sma}-bar SMA.\n")
 
     # Compute every (symbol, param) signal once; reuse across all windows.
     sig_cache: dict[tuple[str, str], pd.Series] = {}

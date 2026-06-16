@@ -27,9 +27,10 @@ class Settings(BaseSettings):
     symbols: list[str] = Field(default=["AAPL", "MSFT"], validation_alias="BOT_SYMBOLS")
     timeframe: str = Field(default="1Day", validation_alias="BOT_TIMEFRAME")
 
-    # Minimum bars required before the bot will act (covers RSI/StochRSI/MFI warmup
-    # plus the divergence lookback, with headroom for Wilder smoothing to converge).
-    warmup_bars: int = 150
+    # Absolute floor for bars before the bot acts. The live guard uses
+    # max(warmup_bars, StochRsiMfiParams.min_bars), so changing trend_sma/timeframe can't
+    # silently invalidate the regime gate — this is just a lower bound.
+    warmup_bars: int = 220
 
     # Local SQLite ledger path.
     ledger_path: str = "data/ledger.sqlite"

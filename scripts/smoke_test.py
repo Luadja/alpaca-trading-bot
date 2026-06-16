@@ -35,11 +35,17 @@ def main() -> None:
     print("Open positions:", broker.positions() or "none")
 
     data = HistoricalData(settings)
-    df = data.get_bars(args.symbol, parse_timeframe(settings.timeframe), lookback_days=400, use_cache=False)
+    df = data.get_bars(args.symbol, parse_timeframe(settings.timeframe), lookback_days=500, use_cache=False)
     print(f"\nFetched {len(df)} bars for {args.symbol}.")
+    strategy = StochRsiMfiStrategy()
     if not df.empty:
         print(f"Latest close: {df['close'].iloc[-1]:.2f}")
-        decision = StochRsiMfiStrategy().generate(df, args.symbol)
+        if len(df) < strategy.params.min_bars:
+            print(
+                f"  WARNING: {len(df)} bars < {strategy.params.min_bars} needed — the live "
+                f"bot would skip this symbol (trend filter SMA not yet valid)."
+            )
+        decision = strategy.generate(df, args.symbol)
         print(
             f"Latest signal: {decision.signal.value} | confidence={decision.confidence} "
             f"| {decision.reason}"

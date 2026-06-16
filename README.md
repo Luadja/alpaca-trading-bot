@@ -30,6 +30,7 @@ Long-only (shorting adds margin/borrow complexity — add it later):
 |---|---|
 | **Enter long** | StochRSI %K crosses **above** %D while oversold, **and** MFI is oversold (volume confirms buyers) |
 | **Exit long** | StochRSI %K crosses **below** %D while overbought, **or** MFI overbought |
+| **Trend filter** | **On by default** — longs only when price is above its 200-day SMA, so the bot doesn't buy dips in a downtrend. Validated to cut the 2022 bear drawdown ~73% (see [docs/PLAN.md](docs/PLAN.md) §10). Disable with `use_trend_filter=False`. |
 | **Divergence** | Bullish divergence (price lower-low + MFI higher-low) raises confidence to 1.0; set `divergence_required=True` to make it mandatory for entries |
 
 All thresholds live in [`StochRsiMfiParams`](bot/strategy/stoch_rsi_mfi.py). The same

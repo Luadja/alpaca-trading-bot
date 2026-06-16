@@ -48,13 +48,32 @@ class StochRsiMfiParams:
     div_right: int = 3
     div_lookback: int = 60
     div_confirm_window: int = 5
+    # Trend/regime filter: only take longs when price is above its long SMA. ON by
+    # default — validated to cut the 2022 bear drawdown ~73% and improve out-of-sample
+    # robustness (see docs/PLAN.md §10). Set False to trade the raw oscillator.
+    use_trend_filter: bool = True
+    trend_sma: int = 200
+
+    @property
+    def min_bars(self) -> int:
+        """Bars needed before signals are meaningful: the longest active indicator
+        window plus headroom. The live guard uses this so changing trend_sma (or the
+        timeframe) can't silently leave the regime gate invalid on the latest bar."""
+        oscillator = self.rsi_length + self.stoch_length + self.k_smooth + self.d_smooth
+        need = max(oscillator, self.mfi_length)
+        if self.use_divergence:
+            need = max(need, self.div_lookback)
+        if self.use_trend_filter:
+            need = max(need, self.trend_sma)
+        return need + 20
 
 
 def compute_signals(df: pd.DataFrame, params: StochRsiMfiParams | None = None) -> pd.DataFrame:
     """Append indicator + signal columns to ``df`` and return a new frame.
 
     Adds: stochrsi, stochrsi_k, stochrsi_d, mfi, bull_div, bear_div, signal,
-    confidence. ``signal`` is +1 (enter long), -1 (exit long), 0 (hold).
+    confidence (plus sma_trend when use_trend_filter). ``signal`` is +1 (enter long),
+    -1 (exit long), 0 (hold).
     """
     p = params or StochRsiMfiParams()
     out = df.copy()
@@ -74,8 +93,16 @@ def compute_signals(df: pd.DataFrame, params: StochRsiMfiParams | None = None) -
     cross_up = (k > d) & (k.shift(1) <= d.shift(1))
     cross_down = (k < d) & (k.shift(1) >= d.shift(1))
 
+    # Trend filter: only allow longs when price is above its long SMA, so the bot
+    # doesn't buy oversold dips in a sustained downtrend. Open (always True) when off.
+    if p.use_trend_filter:
+        out["sma_trend"] = out["close"].rolling(p.trend_sma).mean()
+        trend_ok = out["close"] > out["sma_trend"]
+    else:
+        trend_ok = pd.Series(True, index=out.index)
+
     # Base long trigger, independent of divergence (used for the confidence tiers).
-    base_long = cross_up & (k < p.stoch_oversold) & (out["mfi"] < p.mfi_oversold)
+    base_long = cross_up & (k < p.stoch_oversold) & (out["mfi"] < p.mfi_oversold) & trend_ok
     exit_cond = cross_down & ((k > p.stoch_overbought) | (out["mfi"] > p.mfi_overbought))
 
     recent_bull = (

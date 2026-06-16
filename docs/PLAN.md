@@ -1,8 +1,8 @@
 # Project Plan — Alpaca StochRSI + MFI Trading Bot
 
-> Status as of **2026-06-16**: skeleton built, verified (18 tests + live paper smoke
-> test + basket backtest), committed (`703f9f4`). Currently in the **tune & validate**
-> phase. This is a living document — update the status boxes as work progresses.
+> Status as of **2026-06-16**: skeleton built, verified (full test suite + live paper smoke
+> test + basket backtest + walk-forward validation), committed. Currently in the **tune &
+> validate** phase. This is a living document — update the status boxes as work progresses.
 
 ---
 
@@ -92,7 +92,8 @@ Long-only. The single source of truth is `compute_signals()` (shared by live + b
 | **Divergence** | Bullish (price lower-low + MFI higher-low) raises confidence 0.5→1.0; `divergence_required=True` makes it mandatory (found too strict in testing — see §10) |
 
 Default params (`StochRsiMfiParams`): RSI 14, Stoch 14, %K/%D 3/3, stoch bands 20/80,
-MFI 14, MFI bands 30/80, divergence as confidence (not required), pivots 3/3, lookback 60.
+MFI 14, MFI bands 30/80, divergence as confidence (not required), pivots 3/3, lookback 60,
+**trend filter ON** (longs only when price > 200-day SMA — validated, see §10).
 
 ---
 
@@ -126,10 +127,10 @@ MFI 14, MFI bands 30/80, divergence as confidence (not required), pivots 3/3, lo
 - [x] **Phase 4 — Risk.** Sizing, gates, kill switch (tested).
 - [x] **Phase 5 — Execution & state.** Idempotent orders, SQLite ledger, reconcile.
 - [x] **Phase 6 — Backtest harness.** `backtesting.py` + multi-symbol parameter sweep.
-- [~] **Phase 7 — Tune & validate (CURRENT).** Sweep ✅ and out-of-sample/walk-forward +
-      regime tests ✅ done (`backtests/validate.py`). Result: **no validated edge on daily
-      bars and a dangerous bear-market profile** (see §10). Next: add a trend/regime filter
-      and re-validate before any intraday work or default changes.
+- [~] **Phase 7 — Tune & validate (CURRENT).** Sweep ✅, out-of-sample/walk-forward + regime
+      tests ✅, trend/regime filter added and validated ✅ (now the default). The filter cut the
+      2022 bear drawdown ~73% and improved OOS robustness (see §10). Still does not beat
+      buy-and-hold and is low-activity. Next: intraday timeframe sweep, then paper.
 - [ ] **Phase 8 — Paper run.** ~2 weeks live on paper; watch reconnects, partial fills, restart recovery.
 - [ ] **Phase 9 — Go live (small).** `ALPACA_PAPER=false`, capital you can lose, ramp slowly.
 - [ ] **Phase 10 — Deploy.** Linux VPS under systemd (`Restart=on-failure`) or Docker
@@ -139,12 +140,12 @@ MFI 14, MFI bands 30/80, divergence as confidence (not required), pivots 3/3, lo
 
 ## 9. Current status
 
-- ✅ Skeleton built and committed (`703f9f4`, 33 files).
-- ✅ **18/18 tests pass**; all modules compile.
-- ✅ Indicator math + every `alpaca-py` call adversarially reviewed and fixed.
-- ✅ Paper connection verified (equity $100k, data flowing).
-- ✅ End-to-end backtest + 10-symbol parameter sweep run successfully.
-- ⏳ Uncommitted: SIP/IEX feed-override tweaks used by the sweep.
+- ✅ Skeleton built, reviewed, committed; indicator math + every `alpaca-py` call verified.
+- ✅ **21/21 tests pass**; all modules compile.
+- ✅ Paper connection verified (equity $100k, data flowing); backtest + sweep + walk-forward
+  validation all run end to end.
+- ✅ Trend filter implemented, validated, and made the **default** (Phase 7).
+- ⏳ Next: intraday timeframe sweep, then paper run (Phase 8).
 
 ---
 
@@ -164,7 +165,8 @@ MFI 14, MFI bands 30/80, divergence as confidence (not required), pivots 3/3, lo
 
 In-sample 2018-06→2021-12 (picks params), out-of-sample 2022-01→now (tests them):
 
-- **No validated edge.** The best *active* in-sample config (`stoch40/60 mfi45/55 div=N`)
+- **No validated edge — raw oscillator, trend filter OFF; superseded by the trend-filter
+  result below.** The best *active* in-sample config (`stoch40/60 mfi45/55 div=N`)
   degraded out-of-sample (Sharpe **0.21 → 0.10**, win 65%→59%, DD −24%→−28%) and beat
   buy-and-hold on only **1 of 15** symbols in both windows.
 - **Bear-market blow-up (the key risk).** In the 2022 bear it returned **−14.7%
@@ -178,20 +180,35 @@ In-sample 2018-06→2021-12 (picks params), out-of-sample 2022-01→now (tests t
   ~0.3 times in 3.5 years. `validate.py` now applies a `--min-trades` eligibility filter.
 - `divergence_required=True` confirmed near-inert across 8 years → keep divergence as a
   confidence booster only.
-- **Verdict:** do **not** trade this as-is. The signal works in up/sideways regimes but
-  must not buy dips in sustained downtrends.
+- **Verdict:** do **not** trade the raw oscillator. The signal works in up/sideways
+  regimes but must not buy dips in sustained downtrends → fixed by the trend filter below.
+
+### Trend filter result (now the default)
+
+Re-ran the same walk-forward with `use_trend_filter=True` (longs only when price > 200-SMA):
+
+- **2022 bear blow-up fixed:** best-active config went from **−14.7% (DD −22.8%)** to
+  **−3.9% (DD −9.3%)** — the bot stops buying dips in a downtrend (2022 trades 5.0 → 1.6).
+- **More robust out-of-sample:** that config's Sharpe held at **0.13 → 0.19** IS→OOS (vs
+  0.21 → 0.10 unfiltered), with OOS drawdown −27.9% → −17.2%.
+- **Best overall config = default params + trend filter:** OOS Sharpe **0.32**, **80% win
+  rate**, max DD **−8.6%**, +9.8% — and it improved rather than degraded out-of-sample.
+- ⚠️ Still **does not beat buy-and-hold** (1/15 names) and is **low-activity** (~4 trades /
+  4yr OOS → thin statistical power). Positioning: a conservative, drawdown-controlled
+  strategy, not a market-beater. More activity/signal is the job of an intraday timeframe.
 
 ---
 
 ## 11. Open decisions & next steps
 
-1. **Add a trend / regime filter (top priority).** Directly fixes the 2022 falling-knife
-   blow-up: only take long mean-reversion entries when the trend is up — e.g. price above
-   its 200-day SMA, and/or only when SPY is above its own 200DMA. Then re-run `validate.py`
-   to confirm it removes the bear-market drawdown while keeping up/sideways participation.
-2. **Keep the conservative default params** — they validated more robustly than the looser set.
-3. **Intraday sweep** (15Min / 1Hour) — only after (1); more natural for this signal style.
-4. Decide if/when to wire the **websocket stream** (Phase 8+) vs. staying on polling.
+1. ~~Add a trend / regime filter~~ ✅ **Done** — per-symbol price > 200-SMA, now the default
+   (`validate.py --trend-filter` reproduces the result). A market-wide SPY-regime gate is a
+   possible follow-up (needs cross-symbol data into the strategy).
+2. ~~Keep the conservative default params~~ ✅ confirmed more robust than the looser set.
+3. **Intraday sweep (top priority now)** — 15Min / 1Hour, where this signal style is more
+   natural and trades more often (the current edge is real but too low-activity for confidence).
+4. **Paper run (Phase 8)** once an intraday/daily config is settled.
+5. Decide if/when to wire the **websocket stream** (Phase 8+) vs. staying on polling.
 
 ---
 

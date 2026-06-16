@@ -46,16 +46,22 @@ def build_grid() -> list[StochRsiMfiParams]:
                         mfi_overbought=100 - mfi_os,
                         use_divergence=True,
                         divergence_required=div_required,
+                        # Pin filter OFF so the sweep measures the raw oscillator,
+                        # independent of the shipped default (which is now ON).
+                        use_trend_filter=False,
                     )
                 )
     return grid
 
 
 def pkey(p: StochRsiMfiParams) -> str:
+    # Encode the trend dimension too, so output discloses filter state and mixed-trend
+    # grids can't collide on the same cache key.
+    trend = f"tf{int(p.trend_sma)}" if p.use_trend_filter else "tf-off"
     return (
         f"stoch{int(p.stoch_oversold)}/{int(p.stoch_overbought)} "
         f"mfi{int(p.mfi_oversold)}/{int(p.mfi_overbought)} "
-        f"div={'Y' if p.divergence_required else 'N'}"
+        f"div={'Y' if p.divergence_required else 'N'} {trend}"
     )
 
 
