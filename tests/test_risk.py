@@ -88,6 +88,24 @@ def test_entry_approved_when_within_limits():
     assert decision.qty > 0
 
 
+def test_vol_targeting_sizes_inversely_to_volatility():
+    rm = RiskManager(
+        RiskConfig(use_vol_targeting=True, vol_target_pct=0.02, max_position_pct=0.10), 100_000
+    )
+    # qty = (equity * 0.02) / (price * sigma) = 2000 / (100 * 0.25) = 80 shares (8% < cap)
+    assert rm.position_size(equity=100_000, price=100, sigma=0.25) == 80
+    # low-vol name would size huge -> clamped to the 10% position cap (100 shares)
+    assert rm.position_size(equity=100_000, price=100, sigma=0.05) == 100
+    # higher vol -> smaller position
+    assert rm.position_size(equity=100_000, price=100, sigma=0.50) == 40
+
+
+def test_vol_targeting_off_ignores_sigma():
+    rm = RiskManager(RiskConfig(use_vol_targeting=False, max_position_pct=0.10), 100_000)
+    # falls back to the position cap when no stop given; sigma is ignored
+    assert rm.position_size(equity=100_000, price=100, sigma=0.25) == 100
+
+
 def test_catastrophic_stop_triggers_below_threshold():
     rm = RiskManager(RiskConfig(catastrophic_stop_pct=0.10), 100_000)
     assert rm.should_stop_out(entry_price=100, current_price=89)  # -11% -> stop

@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from datetime import date, datetime
@@ -34,7 +35,7 @@ from bot.logging_setup import setup_logging
 from bot.models import SignalDecision, SignalType
 from bot.risk import RiskConfig, RiskManager
 from bot.state import Ledger
-from bot.strategy import make_strategy
+from bot.strategy import TrendMomentumParams, TrendMomentumStrategy, make_strategy
 
 try:
     from zoneinfo import ZoneInfo
@@ -46,6 +47,16 @@ except Exception:  # pragma: no cover - falls back if tzdata is missing
 
 def _trading_date() -> date:
     return (datetime.now(_ET) if _ET else datetime.utcnow()).date()
+
+
+def _periods_per_year(timeframe: str) -> float:
+    """Bars per year for the given timeframe, to annualize volatility correctly."""
+    m = re.fullmatch(r"(\d+)\s*(min|hour|day|week|month)s?", timeframe.strip().lower())
+    if not m:
+        return 252.0
+    amount, unit = int(m.group(1)), m.group(2)
+    per = {"min": 252 * 390, "hour": 252 * 6.5, "day": 252, "week": 52, "month": 12}[unit]
+    return per / amount
 
 
 def _avg_price(order) -> float | None:
@@ -66,10 +77,15 @@ class TradingBot:
         self._lock = threading.RLock()
         self.broker = Broker(settings)
         self.data = HistoricalData(settings)
-        self.strategy = make_strategy(settings.strategy)
+        self.strategy = self._build_strategy()
         self.ledger = Ledger(settings.ledger_path)
         self.alerter = alerter_from_settings(settings)
         self.timeframe = parse_timeframe(settings.timeframe)
+        self._vol_annualization = _periods_per_year(settings.timeframe) ** 0.5
+        self._risk_config = RiskConfig(
+            use_vol_targeting=settings.use_vol_targeting,
+            vol_target_pct=settings.vol_target_pct,
+        )
 
         account = self.broker.account()
         self.risk = self._init_risk(account.equity)  # rehydrates kill-switch state if persisted
@@ -121,12 +137,18 @@ class TradingBot:
             abs(float(p.market_value)) for p in positions_raw if p.symbol not in stopped
         )
 
+        # Market-regime gate (Faber): only allow NEW longs when the broad market is up.
+        regime_ok = self._market_regime_ok()
+        if not regime_ok:
+            self.log.info("Market regime DOWN (%s < %d-SMA) — exits only, no new entries.",
+                          self.settings.market_regime_symbol, self.settings.market_regime_sma)
+
         for symbol in self.settings.symbols:
             if symbol in stopped:
                 continue  # just flattened on the stop — don't re-act this cycle
             try:
                 running_exposure = self._evaluate_symbol(
-                    symbol, account.equity, positions, running_exposure
+                    symbol, account.equity, positions, running_exposure, regime_ok
                 )
             except Exception as exc:  # one bad symbol shouldn't take down the loop
                 self.log.exception("error evaluating %s", symbol)
@@ -155,7 +177,7 @@ class TradingBot:
                 positions[p.symbol] = 0.0
         return stopped
 
-    def _evaluate_symbol(self, symbol, equity, positions, running_exposure) -> float:
+    def _evaluate_symbol(self, symbol, equity, positions, running_exposure, regime_ok=True) -> float:
         # ~550 daily bars: enough that the 200-SMA is valid well before recent crosses
         # (a short window can miss the last golden/death cross). Reduce for sub-daily.
         df = self.data.get_bars(symbol, self.timeframe, lookback_days=800, use_cache=False)
@@ -174,7 +196,11 @@ class TradingBot:
         self.log.info("%s: %s (%s)", symbol, decision.signal.value, decision.reason)
 
         if decision.signal is SignalType.ENTER_LONG and held == 0:
-            risk = self.risk.evaluate_entry(equity, decision.price, running_exposure)
+            if not regime_ok:
+                self.log.info("%s: entry blocked — market regime down", symbol)
+                return running_exposure
+            sigma = float(df["close"].pct_change().std() * self._vol_annualization)  # annualized
+            risk = self.risk.evaluate_entry(equity, decision.price, running_exposure, sigma=sigma)
             if not risk.approved:
                 self.log.info("%s: entry blocked — %s", symbol, risk.reason)
                 return running_exposure
@@ -254,6 +280,33 @@ class TradingBot:
             self._persist_risk()
         self.log.info("New trading day %s — anchors rolled; halted=%s", today, self.risk.halted)
 
+    def _build_strategy(self):
+        """Construct the configured strategy, injecting settings-driven params."""
+        if self.settings.strategy == "trend_momentum":
+            return TrendMomentumStrategy(
+                TrendMomentumParams(enter_on_regime=self.settings.trend_enter_on_regime)
+            )
+        return make_strategy(self.settings.strategy)
+
+    def _market_regime_ok(self) -> bool:
+        """True if the broad market is in an uptrend (price > long SMA). Gates NEW longs
+        only; fail-open on error/short history (the kill switch is the real safety net)."""
+        if not self.settings.use_market_regime_filter:
+            return True
+        try:
+            df = self.data.get_bars(
+                self.settings.market_regime_symbol, parse_timeframe("1Day"),
+                lookback_days=500, use_cache=False,
+            )
+            sma_len = self.settings.market_regime_sma
+            if len(df) < sma_len:
+                return True
+            sma = df["close"].rolling(sma_len).mean().iloc[-1]
+            return float(df["close"].iloc[-1]) > float(sma)
+        except Exception:
+            self.log.exception("market-regime check failed — allowing entries")
+            return True
+
     # --- risk persistence + reconcile + safety poll ------------------------
     def _init_risk(self, equity: float) -> RiskManager:
         """Construct the RiskManager, rehydrating persisted kill-switch state and rolling
@@ -261,12 +314,12 @@ class TradingBot:
         self._session_date = _trading_date()
         saved = self.ledger.get_state("risk")
         if not saved:
-            return RiskManager(RiskConfig(), equity)
+            return RiskManager(self._risk_config, equity)
         try:
             s = json.loads(saved)
             legacy = s.get("halted", False)  # tolerate a pre-per-horizon snapshot
             rm = RiskManager(
-                RiskConfig(),
+                self._risk_config,
                 s["day_start_equity"],
                 week_start_equity=s["week_start_equity"],
                 month_start_equity=s["month_start_equity"],
@@ -287,7 +340,7 @@ class TradingBot:
             return rm
         except Exception:
             self.log.exception("could not rehydrate risk state — starting fresh")
-            return RiskManager(RiskConfig(), equity)
+            return RiskManager(self._risk_config, equity)
 
     def _persist_risk(self) -> None:
         snap = self.risk.snapshot()

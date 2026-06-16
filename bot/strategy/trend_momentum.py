@@ -45,6 +45,10 @@ class TrendMomentumParams:
     # new golden cross). Available as an option. See docs/PLAN.md §10.
     use_trailing_stop: bool = False
     trail_pct: float = 0.15  # exit if close falls this fraction below the peak since entry
+    # Enter when ALREADY in an uptrend (fast > slow), not only on a fresh golden cross — so
+    # a freshly-started bot can adopt an in-progress trend instead of sitting out. Off by
+    # default (changes signal counts; validate first).
+    enter_on_regime: bool = False
 
     @property
     def min_bars(self) -> int:
@@ -68,25 +72,36 @@ def compute_signals(df: pd.DataFrame, params: TrendMomentumParams | None = None)
     cross_up = (f > s) & (f.shift(1) <= s.shift(1))
     cross_down = (f < s) & (f.shift(1) >= s.shift(1))
 
-    enter = cross_up
+    # Entry filters (regime SMA / ROC) apply to BOTH the cross event and the state entry.
+    filt = pd.Series(True, index=out.index)
     if p.use_regime_filter:
         out["sma_regime"] = out["close"].rolling(p.regime_sma).mean()
-        enter = enter & (out["close"] > out["sma_regime"])
+        filt = filt & (out["close"] > out["sma_regime"])
     if p.roc_length:
         out["roc"] = out["close"].pct_change(p.roc_length, fill_method=None) * 100.0
-        enter = enter & (out["roc"] > p.roc_min)
+        filt = filt & (out["roc"] > p.roc_min)
+
+    enter_cross = (cross_up & filt).fillna(False).to_numpy()
+    fast_gt_slow = (f > s).fillna(False).to_numpy()
+    # State entry: already above the slow SMA (uptrend), gated by the same filters.
+    state_long = ((f > s) & filt).fillna(False).to_numpy()
 
     # Stateful pass: while in a position, ride until the death cross OR a trailing stop
     # (close falls trail_pct below the peak close since entry).
     closes = out["close"].to_numpy(dtype=float)
-    enter_arr = enter.fillna(False).to_numpy()
     exit_arr = cross_down.fillna(False).to_numpy()
     sig = np.zeros(len(out), dtype=int)
     in_pos = False
     peak = 0.0
+    state_disarmed = False  # set after a trailing-stop exit taken mid-uptrend
     for i in range(len(out)):
         if not in_pos:
-            if enter_arr[i]:
+            if state_disarmed and not fast_gt_slow[i]:
+                state_disarmed = False  # trend actually broke; a fresh cross may re-enter
+            # A golden-cross EVENT always re-arms; STATE entry is suppressed until then so a
+            # trailing-stop exit can't immediately rebuy the same uptrend (stop-thrash).
+            allow_state = p.enter_on_regime and state_long[i] and not state_disarmed
+            if enter_cross[i] or allow_state:
                 sig[i] = 1
                 in_pos = True
                 peak = closes[i]
@@ -96,6 +111,8 @@ def compute_signals(df: pd.DataFrame, params: TrendMomentumParams | None = None)
             if exit_arr[i] or stop_hit:
                 sig[i] = -1
                 in_pos = False
+                if stop_hit and not exit_arr[i] and fast_gt_slow[i]:
+                    state_disarmed = True  # exited via stop while still in uptrend
 
     out["signal"] = sig
     out["confidence"] = 0.0

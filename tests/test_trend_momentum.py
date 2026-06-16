@@ -78,6 +78,38 @@ def test_trailing_stop_exits_before_death_cross():
         assert stop_exits[0] <= no_stop_exits[0]  # trailing exits no later than death cross
 
 
+def test_enter_on_regime_adopts_inprogress_uptrend():
+    # A steady ramp has no golden-cross EVENT (fast is already > slow when SMAs warm up),
+    # so the default never enters; enter_on_regime lets it adopt the in-progress uptrend.
+    close = np.linspace(100, 200, 120)
+    df = _df(close)
+    no_state = compute_signals(df, TrendMomentumParams(fast_sma=10, slow_sma=30, enter_on_regime=False))
+    with_state = compute_signals(df, TrendMomentumParams(fast_sma=10, slow_sma=30, enter_on_regime=True))
+    assert (no_state["signal"] == 1).sum() == 0
+    assert (with_state["signal"] == 1).sum() >= 1
+
+
+def test_enter_on_regime_does_not_rebuy_after_trailing_stop():
+    # Rise -> ~17% pullback (trips a 15% stop while fast>slow) -> resume. With both flags on,
+    # the bot must NOT immediately rebuy the bar after the stop (stop-thrash).
+    close = np.concatenate([
+        np.linspace(100, 150, 50),
+        np.linspace(150, 125, 10),
+        np.linspace(125, 165, 40),
+    ])
+    df = _df(close)
+    out = compute_signals(
+        df,
+        TrendMomentumParams(fast_sma=10, slow_sma=30, enter_on_regime=True,
+                            use_trailing_stop=True, trail_pct=0.15),
+    )
+    stop_exits = list(out.index[out["signal"] == -1])
+    assert stop_exits, "expected a trailing-stop exit in the pullback"
+    exit_pos = df.index.get_loc(stop_exits[0])
+    # the next bar must not be a fresh entry (state re-entry is disarmed post-stop)
+    assert int(out["signal"].iloc[exit_pos + 1]) != 1
+
+
 def test_generate_returns_decision():
     close = 100 + np.cumsum(np.random.default_rng(1).normal(0, 1, 300))
     decision = TrendMomentumStrategy(TrendMomentumParams(fast_sma=10, slow_sma=30)).generate(

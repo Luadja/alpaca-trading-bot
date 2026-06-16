@@ -6,7 +6,7 @@ own plain dataclasses so they stay free of pydantic/Alpaca at test time.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,12 +24,32 @@ class Settings(BaseSettings):
     # full market). "sip" requires the paid Algo Trader Plus plan.
     feed: str = Field(default="iex", validation_alias="ALPACA_FEED")
 
-    symbols: list[str] = Field(default=["AAPL", "MSFT"], validation_alias="BOT_SYMBOLS")
+    # Diversified, survivorship-free default (broad + sector ETFs) — breadth is what turns
+    # the thin per-symbol trend edge into a respectable portfolio.
+    symbols: list[str] = Field(
+        default=["SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLP", "XLU", "XLY", "IWM"],
+        validation_alias="BOT_SYMBOLS",
+    )
     timeframe: str = Field(default="1Day", validation_alias="BOT_TIMEFRAME")
 
     # Which strategy the live bot trades: "trend_momentum" (validated default) or
     # "stoch_rsi_mfi" (retired mean-reversion — kept for comparison).
     strategy: str = Field(default="trend_momentum", validation_alias="BOT_STRATEGY")
+
+    # Market-regime gate: block new longs when SPY is below its long SMA (Faber-style
+    # drawdown reducer). Conservative — only prevents entries, never adds risk. Default on.
+    use_market_regime_filter: bool = Field(default=True, validation_alias="BOT_MARKET_REGIME_FILTER")
+    market_regime_symbol: str = Field(default="SPY", validation_alias="BOT_MARKET_REGIME_SYMBOL")
+    market_regime_sma: int = 200
+
+    # Volatility-targeted position sizing (inverse-vol). Off by default — validate before
+    # enabling, since the backtest harness uses full-equity sizing (doesn't model this).
+    use_vol_targeting: bool = Field(default=False, validation_alias="BOT_VOL_TARGETING")
+    vol_target_pct: float = Field(default=0.02, validation_alias="BOT_VOL_TARGET_PCT")
+
+    # Trend strategy: enter when already in an uptrend (fast>slow) on startup, not only on a
+    # fresh golden cross. Off by default — changes signal counts, so validate first.
+    trend_enter_on_regime: bool = Field(default=False, validation_alias="BOT_TREND_ENTER_ON_REGIME")
 
     # Absolute floor for bars before the bot acts. The live guard uses
     # max(warmup_bars, StochRsiMfiParams.min_bars), so changing trend_sma/timeframe can't
@@ -47,6 +67,13 @@ class Settings(BaseSettings):
     smtp_port: int = Field(default=587, validation_alias="SMTP_PORT")
     smtp_user: str = Field(default="", validation_alias="SMTP_USER")
     smtp_password: str = Field(default="", validation_alias="SMTP_PASSWORD")
+
+    @field_validator("symbols")
+    @classmethod
+    def _symbols_non_empty(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("BOT_SYMBOLS must list at least one symbol")
+        return v
 
     def assert_keys(self) -> None:
         if not self.api_key or not self.api_secret:

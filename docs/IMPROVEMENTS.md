@@ -26,6 +26,13 @@ market" is how you overfit and trade away the one durable edge (drawdown control
 These are not enhancements; they are latent defects the review found. **Do these before
 any live capital.**
 
+> **Tier 1 (profitability) done (2026-06-16):** ✅ wider survivorship-free default universe
+> (10 ETFs); ✅ SPY>200-SMA market-regime gate (`run.py`, default on — blocks new longs in
+> a downtrend); ✅ volatility-targeted sizing (`RiskConfig`, config-gated, default off); ✅
+> mid-trend entry option (`TrendMomentumParams.enter_on_regime`, default off); ✅ Calmar/
+> Sortino columns + Deflated Sharpe overfitting guard in the validator. All reviewed
+> adversarially (1 churn bug + sigma-annualization + empty-symbols guard fixed).
+
 > **Status (2026-06-16):** ✅ **all of 1.1–1.6 done** — catastrophic stop enforced (`run.py`),
 > exit idempotency via deterministic-coid sell + APScheduler coalesce (1.2), `reconcile`
 > resolves dangling orders against the broker each cycle + at startup (1.3), fill verification

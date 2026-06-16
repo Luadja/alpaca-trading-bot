@@ -26,6 +26,10 @@ class RiskConfig:
     max_weekly_loss_pct: float = 0.06  # kill-switch threshold vs. week-start equity
     max_monthly_loss_pct: float = 0.10  # kill-switch threshold vs. month-start equity
     allow_fractional: bool = False  # whole shares avoid fractional-order constraints
+    # Inverse-volatility sizing: size each position to ~vol_target_pct annualized vol when a
+    # per-symbol sigma is supplied (equalizes risk across quiet/jumpy names). Off by default.
+    use_vol_targeting: bool = False
+    vol_target_pct: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -132,16 +136,26 @@ class RiskManager:
         }
 
     # --- sizing & gates ----------------------------------------------------
-    def position_size(self, equity: float, price: float, stop_price: float | None = None) -> float:
-        """Shares to buy: risk-per-trade if a stop is given, else the position cap.
+    def position_size(
+        self,
+        equity: float,
+        price: float,
+        stop_price: float | None = None,
+        sigma: float | None = None,
+    ) -> float:
+        """Shares to buy, always capped so the position value <= max_position_pct of equity.
 
-        Always capped so the position value <= max_position_pct of equity.
+        Sizing mode: inverse-volatility when vol-targeting is on and an annualized ``sigma``
+        is supplied; else risk-per-trade against a stop; else the position cap.
         """
         if price <= 0:
             return 0.0
         cap_shares = (equity * self.config.max_position_pct) / price
 
-        if stop_price is not None and 0 < stop_price < price:
+        if self.config.use_vol_targeting and sigma and sigma > 0:
+            # position_value * sigma = equity * vol_target_pct  ->  qty = budget / (price*sigma)
+            qty = (equity * self.config.vol_target_pct) / (price * sigma)
+        elif stop_price is not None and 0 < stop_price < price:
             risk_per_share = price - stop_price
             dollars_at_risk = equity * self.config.risk_per_trade_pct
             qty = dollars_at_risk / risk_per_share
@@ -167,8 +181,10 @@ class RiskManager:
         price: float,
         current_exposure_value: float,
         stop_price: float | None = None,
+        sigma: float | None = None,
     ) -> RiskDecision:
-        """Run all gates for a prospective long entry and size it."""
+        """Run all gates for a prospective long entry and size it (sigma = annualized vol
+        for inverse-vol sizing when enabled)."""
         if self.halted or self._breached_any(equity):
             return RiskDecision(False, 0.0, "kill switch: loss limit reached")
 
@@ -179,7 +195,7 @@ class RiskManager:
             return RiskDecision(False, 0.0, "max total exposure reached")
 
         stop = stop_price if stop_price is not None else self.default_stop(price)
-        qty = self.position_size(equity, price, stop)
+        qty = self.position_size(equity, price, stop, sigma=sigma)
         if qty <= 0:
             return RiskDecision(False, 0.0, "sized to zero shares (position too small)")
 
