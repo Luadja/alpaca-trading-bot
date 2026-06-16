@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import math
 import warnings
 
 import numpy as np
@@ -31,6 +32,7 @@ from alpaca.common.exceptions import APIError
 from backtesting import Backtest
 
 from backtests.backtest_stoch_rsi_mfi import SrsiMfiBacktest
+from backtests.deflated_sharpe import deflated_sharpe, expected_max_sharpe
 from backtests.param_sweep import _bt_df
 from backtests.strategies import REGISTRY
 from backtests.universe import resolve_universe
@@ -48,8 +50,8 @@ REGIMES = [
 ]
 
 HEADER = (
-    f"{'window / config':<34} {'ret%':>7} {'sharpe':>7} {'trades':>7} "
-    f"{'win%':>6} {'maxdd%':>7} {'beatBH%':>8} {'n':>3}"
+    f"{'window / config':<34} {'ret%':>7} {'sharpe':>7} {'sortino':>7} {'calmar':>7} "
+    f"{'trades':>7} {'win%':>6} {'maxdd%':>7} {'beatBH%':>8} {'n':>3}"
 )
 
 
@@ -57,11 +59,21 @@ def _ts(s: str) -> pd.Timestamp:
     return pd.Timestamp(s, tz="UTC")
 
 
+def _finite(value) -> float:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return f if math.isfinite(f) else float("nan")
+
+
 def _metrics(stats) -> dict:
     n = int(stats["# Trades"])
     return {
         "ret": float(stats["Return [%]"]),
         "sharpe": float(stats["Sharpe Ratio"]),
+        "sortino": _finite(stats["Sortino Ratio"]),
+        "calmar": _finite(stats["Calmar Ratio"]),
         "trades": n,
         "win": float(stats["Win Rate [%]"]) if n > 0 else np.nan,
         "dd": float(stats["Max. Drawdown [%]"]),
@@ -84,12 +96,16 @@ def _run_window(df, signals, start, end, cash, commission):
 def _aggregate(records: list[dict]) -> dict:
     if not records:  # e.g. a regime window with no data in the loaded range
         nan = float("nan")
-        return {"ret": nan, "sharpe": nan, "trades": 0.0, "win": nan, "dd": nan, "beat": nan, "n": 0}
+        return {k: nan for k in ("ret", "sharpe", "sortino", "calmar", "win", "dd", "beat")} | {
+            "trades": 0.0, "n": 0
+        }
     d = pd.DataFrame(records)
     d["beat"] = d["ret"] > d["bh"]
     return {
         "ret": d["ret"].mean(),
         "sharpe": d["sharpe"].mean(),
+        "sortino": d["sortino"].mean(),
+        "calmar": d["calmar"].mean(),
         "trades": d["trades"].mean(),
         "win": d["win"].mean(),
         "dd": d["dd"].mean(),
@@ -101,8 +117,9 @@ def _aggregate(records: list[dict]) -> dict:
 def _row(label: str, m: dict) -> str:
     win = f"{m['win']:.0f}" if not np.isnan(m["win"]) else "-"
     return (
-        f"{label:<34} {m['ret']:>7.1f} {m['sharpe']:>7.2f} {m['trades']:>7.1f} "
-        f"{win:>6} {m['dd']:>7.1f} {m['beat']:>8.0f} {m['n']:>3}"
+        f"{label:<34} {m['ret']:>7.1f} {m['sharpe']:>7.2f} {m['sortino']:>7.2f} "
+        f"{m['calmar']:>7.2f} {m['trades']:>7.1f} {win:>6} {m['dd']:>7.1f} "
+        f"{m['beat']:>8.0f} {m['n']:>3}"
     )
 
 
@@ -220,7 +237,16 @@ def main() -> None:
     print("-" * len(HEADER))
     for key, m in ranked[:6]:
         print(_row(key, m))
-    print(f"\nIS-best chosen: {best_key}\n")
+
+    # Deflated Sharpe: did the best config beat what selecting over N trials yields by luck?
+    trial_sharpes = [m["sharpe"] for m in is_agg.values()]
+    sample_df = next(iter(bars.values()))
+    n_obs = int(((sample_df.index >= _ts(is_start)) & (sample_df.index < _ts(is_end))).sum())
+    sr0 = expected_max_sharpe(trial_sharpes)
+    dsr = deflated_sharpe(is_agg[best_key]["sharpe"], trial_sharpes, n_obs)
+    print(f"\nIS-best chosen: {best_key}")
+    print(f"Deflated Sharpe: {dsr:.2f} (bless if >=0.95) | luck benchmark SR0={sr0:.2f} "
+          f"vs observed {is_agg[best_key]['sharpe']:.2f} over {len(trial_sharpes)} trials\n")
 
     print("=== OVERFITTING CHECK: IS-best & default, in-sample vs out-of-sample ===")
     print(HEADER)
