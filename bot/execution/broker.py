@@ -26,7 +26,7 @@ from alpaca.trading.requests import (
 
 from bot.config import Settings
 
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
 
 def _retry(fn, *, tries: int = 5, base: float = 1.0):
@@ -52,7 +52,10 @@ def _retry(fn, *, tries: int = 5, base: float = 1.0):
 
 
 def _is_duplicate_coid(exc: APIError) -> bool:
-    return getattr(exc, "status_code", None) == 422 and "client_order_id" in str(exc).lower()
+    if getattr(exc, "status_code", None) not in (409, 422):
+        return False
+    msg = str(exc).lower()
+    return "client_order_id" in msg or "duplicate" in msg
 
 
 @dataclass
@@ -99,6 +102,18 @@ class Broker:
     def is_market_open(self) -> bool:
         return bool(self.market_clock().is_open)
 
+    def get_order(self, client_order_id: str):
+        """Fetch an order by its client_order_id; None if it never landed (404)."""
+        def do():
+            try:
+                return self.client.get_order_by_client_id(client_order_id)
+            except APIError as exc:
+                if getattr(exc, "status_code", None) == 404:
+                    return None
+                raise
+
+        return _retry(do)
+
     # --- writes ------------------------------------------------------------
     @staticmethod
     def new_client_order_id(prefix: str = "bot") -> str:
@@ -116,7 +131,15 @@ class Broker:
                     return self.client.get_order_by_client_id(coid)
                 raise
 
-        return _retry(do)
+        try:
+            return _retry(do)
+        except Exception:
+            # Lost-response edge: the order may have been created server-side before the
+            # error. Reconcile by coid before declaring failure so a created order is never lost.
+            existing = self.get_order(coid)
+            if existing is not None:
+                return existing
+            raise
 
     def submit_market(
         self,

@@ -16,10 +16,49 @@ def test_kill_switch_trips_at_daily_loss_limit():
 
 def test_kill_switch_resets_next_day():
     rm = RiskManager(RiskConfig(max_daily_loss_pct=0.03), 100_000)
-    rm.update(90_000)
+    rm.update(96_000)  # -4%: daily breach only (under weekly 6% / monthly 10%)
     assert rm.halted
-    rm.reset_day(90_000)
+    rm.reset_day(96_000)
+    assert not rm.halted  # daily anchor re-based; weekly/monthly not breached
+
+
+def test_weekly_latch_survives_recovery_and_day_reset():
+    # The regression: a weekly halt must persist even after equity RECOVERS above the
+    # weekly threshold and the day rolls — until the WEEK itself rolls.
+    rm = RiskManager(RiskConfig(max_daily_loss_pct=0.03, max_weekly_loss_pct=0.06), 100_000)
+    assert rm.update(93_000)  # -7%: latches daily AND weekly
+    rm.update(98_000)  # recovered to -2% (no longer breaching) — latches must NOT auto-clear
+    assert rm.halted
+    rm.reset_day(98_000)  # new session: daily latch clears...
+    assert rm.halted  # ...but the weekly latch must persist
+    rm.reset_week(98_000)  # new week finally clears it
     assert not rm.halted
+
+
+def test_monthly_limit():
+    cfg = RiskConfig(max_daily_loss_pct=0.50, max_weekly_loss_pct=0.50, max_monthly_loss_pct=0.10)
+    rm = RiskManager(cfg, 100_000)
+    assert not rm.update(95_000)  # -5%: under all
+    assert rm.update(89_000)  # -11%: over the 10% monthly limit
+
+
+def test_snapshot_roundtrip_preserves_halt():
+    rm = RiskManager(RiskConfig(), 100_000)
+    rm.update(96_000)  # -4%: latches the daily horizon
+    snap = rm.snapshot()
+    assert snap["halted_day"] is True
+    rm2 = RiskManager(
+        RiskConfig(),
+        snap["day_start_equity"],
+        week_start_equity=snap["week_start_equity"],
+        month_start_equity=snap["month_start_equity"],
+        high_water_mark=snap["high_water_mark"],
+        halted_day=snap["halted_day"],
+        halted_week=snap["halted_week"],
+        halted_month=snap["halted_month"],
+    )
+    assert rm2.halted  # a tripped kill switch survives reconstruction (restart)
+    assert rm2.snapshot() == snap
 
 
 def test_position_size_respects_cap():

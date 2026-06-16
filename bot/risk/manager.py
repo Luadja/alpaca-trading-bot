@@ -22,7 +22,9 @@ class RiskConfig:
     risk_per_trade_pct: float = 0.01  # % of equity risked between entry and stop (sizing)
     stop_loss_pct: float = 0.05  # stop distance used for risk-per-trade SIZING only
     catastrophic_stop_pct: float = 0.10  # HARD enforced exit: flatten if price falls this far
-    max_daily_loss_pct: float = 0.03  # kill-switch threshold (loss vs. day-start equity)
+    max_daily_loss_pct: float = 0.03  # kill-switch threshold vs. day-start equity
+    max_weekly_loss_pct: float = 0.06  # kill-switch threshold vs. week-start equity
+    max_monthly_loss_pct: float = 0.10  # kill-switch threshold vs. month-start equity
     allow_fractional: bool = False  # whole shares avoid fractional-order constraints
 
 
@@ -34,17 +36,37 @@ class RiskDecision:
 
 
 class RiskManager:
-    def __init__(self, config: RiskConfig, day_start_equity: float) -> None:
+    def __init__(
+        self,
+        config: RiskConfig,
+        day_start_equity: float,
+        *,
+        week_start_equity: float | None = None,
+        month_start_equity: float | None = None,
+        high_water_mark: float | None = None,
+        halted_day: bool = False,
+        halted_week: bool = False,
+        halted_month: bool = False,
+    ) -> None:
         if day_start_equity <= 0:
             raise ValueError("day_start_equity must be positive")
         self.config = config
         self.day_start_equity = day_start_equity
-        self._halted = False
+        self.week_start_equity = week_start_equity if week_start_equity is not None else day_start_equity
+        self.month_start_equity = (
+            month_start_equity if month_start_equity is not None else day_start_equity
+        )
+        self.high_water_mark = high_water_mark if high_water_mark is not None else day_start_equity
+        # Per-horizon latch flags: each is set by update() on a breach and cleared ONLY by
+        # its own reset, so a still-active weekly/monthly halt survives a day rollover.
+        self._halted_day = halted_day
+        self._halted_week = halted_week
+        self._halted_month = halted_month
 
-    # --- kill switch -------------------------------------------------------
+    # --- kill switch (daily / weekly / monthly horizons) -------------------
     @property
     def halted(self) -> bool:
-        return self._halted
+        return self._halted_day or self._halted_week or self._halted_month
 
     def daily_pnl_pct(self, equity: float) -> float:
         return (equity - self.day_start_equity) / self.day_start_equity
@@ -52,18 +74,62 @@ class RiskManager:
     def breached_daily_loss(self, equity: float) -> bool:
         return self.daily_pnl_pct(equity) <= -self.config.max_daily_loss_pct
 
-    def update(self, equity: float) -> bool:
-        """Call each cycle with current equity. Latches the kill switch. Returns halted."""
-        if self.breached_daily_loss(equity):
-            self._halted = True
-        return self._halted
+    def breached_weekly_loss(self, equity: float) -> bool:
+        return (equity - self.week_start_equity) / self.week_start_equity <= -self.config.max_weekly_loss_pct
 
-    def reset_day(self, day_start_equity: float) -> None:
-        """Clear the kill switch at the start of a new trading day."""
-        if day_start_equity <= 0:
-            raise ValueError("day_start_equity must be positive")
-        self.day_start_equity = day_start_equity
-        self._halted = False
+    def breached_monthly_loss(self, equity: float) -> bool:
+        return (equity - self.month_start_equity) / self.month_start_equity <= -self.config.max_monthly_loss_pct
+
+    def _breached_any(self, equity: float) -> bool:
+        return (
+            self.breached_daily_loss(equity)
+            or self.breached_weekly_loss(equity)
+            or self.breached_monthly_loss(equity)
+        )
+
+    def update(self, equity: float) -> bool:
+        """Call each cycle with current equity. Latches each horizon independently on a
+        breach and tracks the equity high-water mark. Returns halted."""
+        self.high_water_mark = max(self.high_water_mark, equity)
+        if self.breached_daily_loss(equity):
+            self._halted_day = True
+        if self.breached_weekly_loss(equity):
+            self._halted_week = True
+        if self.breached_monthly_loss(equity):
+            self._halted_month = True
+        return self.halted
+
+    def reset_day(self, equity: float) -> None:
+        """New session: re-baseline the day anchor and clear ONLY the daily latch. A
+        still-latched weekly/monthly halt persists until its own boundary rolls."""
+        if equity <= 0:
+            raise ValueError("equity must be positive")
+        self.day_start_equity = equity
+        self._halted_day = False
+
+    def reset_week(self, equity: float) -> None:
+        if equity <= 0:
+            raise ValueError("equity must be positive")
+        self.week_start_equity = equity
+        self._halted_week = False
+
+    def reset_month(self, equity: float) -> None:
+        if equity <= 0:
+            raise ValueError("equity must be positive")
+        self.month_start_equity = equity
+        self._halted_month = False
+
+    def snapshot(self) -> dict:
+        """Serializable state for persistence across restarts (latch order-independent)."""
+        return {
+            "day_start_equity": self.day_start_equity,
+            "week_start_equity": self.week_start_equity,
+            "month_start_equity": self.month_start_equity,
+            "high_water_mark": self.high_water_mark,
+            "halted_day": self._halted_day,
+            "halted_week": self._halted_week,
+            "halted_month": self._halted_month,
+        }
 
     # --- sizing & gates ----------------------------------------------------
     def position_size(self, equity: float, price: float, stop_price: float | None = None) -> float:
@@ -103,8 +169,8 @@ class RiskManager:
         stop_price: float | None = None,
     ) -> RiskDecision:
         """Run all gates for a prospective long entry and size it."""
-        if self._halted or self.breached_daily_loss(equity):
-            return RiskDecision(False, 0.0, "kill switch: daily loss limit reached")
+        if self.halted or self._breached_any(equity):
+            return RiskDecision(False, 0.0, "kill switch: loss limit reached")
 
         if equity <= 0:
             return RiskDecision(False, 0.0, "no equity")

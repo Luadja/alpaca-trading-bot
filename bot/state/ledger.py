@@ -1,12 +1,13 @@
-"""SQLite order ledger.
+"""SQLite order ledger + persistent bot state.
 
 The broker is always the source of truth for positions; this ledger records what
-the bot *intended* and what it *submitted* (keyed by client_order_id for
-idempotency) so it can reconcile after a crash or restart and avoid double-orders.
+the bot *intended*, *submitted*, and how it *filled* (keyed by client_order_id for
+idempotency) so it can reconcile after a crash/restart and avoid double-orders. A
+small key/value table persists risk state (kill-switch latch, equity anchors) so
+safety controls survive restarts.
 
-Thread-safe: the live loop runs ``step`` on an APScheduler worker thread, so the
-connection is opened with check_same_thread=False and every access is serialized
-with a lock.
+Thread-safe: the live loop runs on APScheduler worker threads, so the connection is
+opened with check_same_thread=False and every access is serialized with a lock.
 """
 
 from __future__ import annotations
@@ -19,16 +20,31 @@ from pathlib import Path
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
-    client_order_id TEXT PRIMARY KEY,
-    broker_order_id TEXT,
-    symbol          TEXT NOT NULL,
-    side            TEXT NOT NULL,
-    qty             REAL NOT NULL,
-    status          TEXT NOT NULL,
-    reason          TEXT,
-    created_at      TEXT NOT NULL
+    client_order_id  TEXT PRIMARY KEY,
+    broker_order_id  TEXT,
+    symbol           TEXT NOT NULL,
+    side             TEXT NOT NULL,
+    qty              REAL NOT NULL,
+    status           TEXT NOT NULL,
+    reason           TEXT,
+    filled_qty       REAL DEFAULT 0,
+    filled_avg_price REAL,
+    created_at       TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bot_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 """
+
+# The bot may only (re)submit an order whose row is in one of these states: "intended"
+# (never sent / crashed before submit) or "missing" (sent but the broker has no record).
+# Any other status (submitted / accepted / new / partially_filled / filled / ...) means an
+# order is or was live, so the deterministic coid must NOT be resubmitted.
+_RESUBMITTABLE = ("intended", "missing")
+# Terminal states that need no further reconcile against the broker.
+_TERMINAL = ("filled", "canceled", "rejected", "expired", "done_for_day", "missing")
 
 
 class Ledger:
@@ -39,8 +55,18 @@ class Ledger:
         self.conn.row_factory = sqlite3.Row
         with self._lock, closing(self.conn.cursor()) as cur:
             cur.executescript(_SCHEMA)
+            self._migrate(cur)  # add columns to ledgers created before this schema
             self.conn.commit()
 
+    @staticmethod
+    def _migrate(cur) -> None:
+        existing = {r["name"] for r in cur.execute("PRAGMA table_info(orders)")}
+        for col, ddl in (("filled_qty", "filled_qty REAL DEFAULT 0"),
+                         ("filled_avg_price", "filled_avg_price REAL")):
+            if col not in existing:
+                cur.execute(f"ALTER TABLE orders ADD COLUMN {ddl}")
+
+    # --- orders ------------------------------------------------------------
     def record_intent(
         self, client_order_id: str, symbol: str, side: str, qty: float, reason: str = ""
     ) -> bool:
@@ -61,19 +87,57 @@ class Ledger:
     def mark_status(self, client_order_id: str, status: str) -> None:
         self._update(client_order_id, status=status)
 
+    def record_fill(
+        self, client_order_id: str, filled_qty: float, filled_avg_price: float | None, status: str
+    ) -> None:
+        self._update(
+            client_order_id,
+            status=status,
+            filled_qty=filled_qty,
+            filled_avg_price=filled_avg_price,
+        )
+
     def already_submitted(self, client_order_id: str) -> bool:
+        """True if an order with this id is/was live (so don't resubmit). False only for a
+        fresh id or one in a resubmittable state (intended/missing)."""
+        with self._lock, closing(self.conn.cursor()) as cur:
+            cur.execute("SELECT status FROM orders WHERE client_order_id = ?", (client_order_id,))
+            row = cur.fetchone()
+        return bool(row) and row["status"] not in _RESUBMITTABLE
+
+    def pending_orders(self) -> list[dict]:
+        """Orders not yet in a terminal state — for crash-recovery reconcile."""
+        placeholders = ",".join("?" * len(_TERMINAL))
         with self._lock, closing(self.conn.cursor()) as cur:
             cur.execute(
-                "SELECT status FROM orders WHERE client_order_id = ?", (client_order_id,)
+                f"SELECT client_order_id, symbol, side, qty, status FROM orders "
+                f"WHERE status NOT IN ({placeholders})",
+                _TERMINAL,
             )
-            row = cur.fetchone()
-        return bool(row) and row["status"] in ("submitted", "filled")
+            return [dict(r) for r in cur.fetchall()]
 
     def reconcile(self, broker_positions: dict[str, float]) -> dict[str, float]:
-        """Return the broker's live positions (the truth). Callers should adopt this
-        and log any drift; extend to repair local state as the bot grows."""
+        """Broker positions are the truth; callers adopt this and resolve pending_orders()
+        against the broker (see TradingBot._reconcile_pending)."""
         return dict(broker_positions)
 
+    # --- persistent state (kill switch / equity anchors) -------------------
+    def get_state(self, key: str) -> str | None:
+        with self._lock, closing(self.conn.cursor()) as cur:
+            cur.execute("SELECT value FROM bot_state WHERE key = ?", (key,))
+            row = cur.fetchone()
+        return row["value"] if row else None
+
+    def set_state(self, key: str, value: str) -> None:
+        with self._lock, closing(self.conn.cursor()) as cur:
+            cur.execute(
+                "INSERT INTO bot_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, value, _now()),
+            )
+            self.conn.commit()
+
+    # --- internals ---------------------------------------------------------
     def _update(self, client_order_id: str, **fields: object) -> None:
         cols = ", ".join(f"{k} = ?" for k in fields)
         with self._lock, closing(self.conn.cursor()) as cur:

@@ -26,9 +26,15 @@ market" is how you overfit and trade away the one durable edge (drawdown control
 These are not enhancements; they are latent defects the review found. **Do these before
 any live capital.**
 
-> **Status (2026-06-16):** ✅ **1.1** (catastrophic stop now enforced in `run.py._enforce_stops`
-> using the broker's entry/current prices) and ✅ **1.5** (retry/backoff + idempotent submit in
-> `broker.py`) are done; the §4 **market-clock gate** is also in. Remaining: 1.2, 1.3, 1.4, 1.6.
+> **Status (2026-06-16):** ✅ **all of 1.1–1.6 done** — catastrophic stop enforced (`run.py`),
+> exit idempotency via deterministic-coid sell + APScheduler coalesce (1.2), `reconcile`
+> resolves dangling orders against the broker each cycle + at startup (1.3), fill verification
+> / partial fills recorded (1.4), retry/backoff + idempotent submit with a lost-response
+> fallback (1.5), and the kill switch is now multi-horizon (daily/weekly/monthly, per-horizon
+> latch), persisted across restarts, with an independent fast safety-poll and a trade lock
+> closing the kill↔submit race. Market-clock gate (§4) is in. **Reviewed adversarially**
+> (3 high-sev bugs found and fixed). Remaining Tier 0: monitoring/alerting + watchdog (§4),
+> and the research gates (survivorship-free universe, realistic costs, go-live gate; §5).
 
 | # | Gap | Where | Fix | Sev |
 |---|---|---|---|---|
