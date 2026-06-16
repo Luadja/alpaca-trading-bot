@@ -223,7 +223,14 @@ class TradingBot:
             if self.ledger.already_submitted(coid):
                 return 0.0  # already acted on this exact bar — idempotent
             self.ledger.record_intent(coid, symbol, "buy", qty, decision.reason)
-            order = self.broker.submit_market(symbol, qty, OrderSide.BUY, client_order_id=coid)
+            # Anchor the marketable limit on a LIVE price (the bar close is stale on a daily
+            # timeframe). No live price -> fall back to a market order (guaranteed fill).
+            ref = self.data.latest_price(symbol) if self.settings.use_marketable_limit else None
+            if ref:
+                limit = round(ref * (1 + self.settings.slippage_cap_pct), 2)
+                order = self.broker.submit_limit(symbol, qty, OrderSide.BUY, limit, client_order_id=coid)
+            else:
+                order = self.broker.submit_market(symbol, qty, OrderSide.BUY, client_order_id=coid)
             self.ledger.mark_submitted(coid, str(order.id))
         filled = self._await_fill(coid)
         self.log.info("%s: BUY %s/%s filled (coid=%s)", symbol, filled, qty, coid)

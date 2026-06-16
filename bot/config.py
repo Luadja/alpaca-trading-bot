@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     # fresh golden cross. Off by default — changes signal counts, so validate first.
     trend_enter_on_regime: bool = Field(default=False, validation_alias="BOT_TREND_ENTER_ON_REGIME")
 
+    # Execution: use marketable-limit BUYs (price * (1+cap)) to bound slippage instead of
+    # naked market orders. Exits stay market (guaranteed). A gap beyond the cap just won't
+    # fill (no chasing). On by default; widen/disable for thin names.
+    use_marketable_limit: bool = Field(default=True, validation_alias="BOT_MARKETABLE_LIMIT")
+    slippage_cap_pct: float = Field(default=0.005, validation_alias="BOT_SLIPPAGE_CAP_PCT")
+
     # Absolute floor for bars before the bot acts. The live guard uses
     # max(warmup_bars, StochRsiMfiParams.min_bars), so changing trend_sma/timeframe can't
     # silently invalidate the regime gate — this is just a lower bound.
@@ -73,6 +79,13 @@ class Settings(BaseSettings):
     def _symbols_non_empty(cls, v: list[str]) -> list[str]:
         if not v:
             raise ValueError("BOT_SYMBOLS must list at least one symbol")
+        return v
+
+    @field_validator("slippage_cap_pct")
+    @classmethod
+    def _slippage_sane(cls, v: float) -> float:
+        if not 0 < v < 0.1:  # negative would price the buy below market (never fills); >10% is absurd
+            raise ValueError("BOT_SLIPPAGE_CAP_PCT must be between 0 and 0.1")
         return v
 
     def assert_keys(self) -> None:

@@ -117,6 +117,26 @@ bot dies. Configure alerts (Slack/email) in `.env` so kill-switch trips, rejects
 heartbeat loss page you. See [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) for the full
 hardening roadmap.
 
+### Running on Windows (keep-alive)
+
+A trend bot must stay up to catch crosses. Easiest:
+
+```powershell
+# Runs the bot + watchdog, auto-restarting the bot if it crashes (Ctrl+C to stop):
+powershell -ExecutionPolicy Bypass -File scripts\run_windows.ps1
+```
+
+To survive logout/reboot, register that script with **Task Scheduler** ("Run whether user
+is logged on or not", trigger "At startup"), or wrap `python -m bot.run` as a service with
+[NSSM](https://nssm.cc/). Before going live, gate it: `python -m scripts.go_live_check`.
+
+### Validating a strategy
+
+```powershell
+python -m backtests.validate --strategy trend_momentum --universe etf --cost-sweep
+python -m backtests.walk_forward --strategy trend_momentum --universe etf   # OOS distribution
+```
+
 ## Risk controls (built in)
 
 - **Daily-loss kill switch** — flattens everything and blocks new entries once the

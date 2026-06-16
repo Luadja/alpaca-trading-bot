@@ -17,7 +17,7 @@ from pathlib import Path
 import pandas as pd
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from bot.config import Settings
@@ -55,6 +55,15 @@ class HistoricalData:
         self.feed = _feed(settings.feed)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def latest_price(self, symbol: str) -> float | None:
+        """Most recent trade price (real-time IEX, free) for anchoring marketable limits;
+        None on any error so the caller can fall back to a market order."""
+        try:
+            req = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
+            return float(self.client.get_stock_latest_trade(req)[symbol].price)
+        except Exception:
+            return None
 
     def get_bars(
         self,

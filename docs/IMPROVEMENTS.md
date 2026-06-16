@@ -32,6 +32,15 @@ any live capital.**
 > mid-trend entry option (`TrendMomentumParams.enter_on_regime`, default off); ✅ Calmar/
 > Sortino columns + Deflated Sharpe overfitting guard in the validator. All reviewed
 > adversarially (1 churn bug + sigma-annualization + empty-symbols guard fixed).
+>
+> **Tier 2 (build-anytime) done (2026-06-17):** ✅ marketable-limit BUYs anchored on a live
+> IEX price (bound slippage; market fallback; exits/flatten stay market); ✅ purged
+> walk-forward validator (`backtests/walk_forward.py`) reporting the OOS distribution +
+> config stability; ✅ Windows keep-alive launcher (`scripts/run_windows.ps1`, supervises
+> bot + watchdog). Reviewed adversarially (walk-forward crash, stale-anchor, slippage-range,
+> watchdog-orphan fixed). **Deferred until paper evidence** (speculative): cross-sectional
+> momentum sleeve, correlation-aware sizing, half-Kelly cap, drawdown-tiered de-risking,
+> TradingStream, CPCV combinatorial paths.
 
 > **Status (2026-06-16):** ✅ **all of 1.1–1.6 done** — catastrophic stop enforced (`run.py`),
 > exit idempotency via deterministic-coid sell + APScheduler coalesce (1.2), `reconcile`
