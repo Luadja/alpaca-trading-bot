@@ -2,8 +2,8 @@
 
 Backtests a grid of StochRSI/MFI thresholds (and divergence on/off) over several
 symbols, then ranks parameter sets by their MEAN performance across the basket so
-you don't overfit to a single name. Uses the full-market delayed_sip feed for bar
-fidelity (free, since the data is >15 min old) and split/dividend-adjusted bars.
+you don't overfit to a single name. Uses the full-market SIP feed for bar fidelity
+(free for history >15 min old; falls back to IEX) and split/dividend-adjusted bars.
 
 Research only — same caveats as any backtest (optimistic fills, no live slippage).
 
@@ -19,6 +19,7 @@ import warnings
 
 import numpy as np
 import pandas as pd
+from alpaca.common.exceptions import APIError
 from backtesting import Backtest
 
 from backtests.backtest_stoch_rsi_mfi import SrsiMfiBacktest
@@ -76,19 +77,29 @@ def main() -> None:
     args = ap.parse_args()
 
     settings = load_settings()
-    settings.feed = "delayed_sip"  # accurate full-market bars, free for data >15 min old
     data = HistoricalData(settings)
     tf = parse_timeframe(args.timeframe)
+    lookback = int(args.years * 365)
 
-    # Fetch each symbol once and reuse across the whole grid.
+    # Prefer full-market SIP (free for history >15 min old); fall back to IEX if the
+    # account can't access SIP history.
+    feed_used = "sip"
     bars: dict[str, pd.DataFrame] = {}
     for sym in args.symbols:
-        df = data.get_bars(sym, tf, lookback_days=int(args.years * 365), use_cache=False)
+        try:
+            df = data.get_bars(sym, tf, lookback_days=lookback, use_cache=False, feed=feed_used)
+        except APIError as exc:
+            if feed_used == "sip":
+                print(f"  SIP history unavailable ({exc}); falling back to IEX feed.")
+                feed_used = "iex"
+                df = data.get_bars(sym, tf, lookback_days=lookback, use_cache=False, feed=feed_used)
+            else:
+                raise
         if df.empty or len(df) < 150:
             print(f"  skip {sym}: only {len(df)} bars")
             continue
         bars[sym] = df
-    print(f"Loaded {len(bars)} symbols, {len(build_grid())} param sets each "
+    print(f"Loaded {len(bars)} symbols via {feed_used} feed, {len(build_grid())} param sets each "
           f"({args.years}yr {args.timeframe}).\n")
 
     grid = build_grid()

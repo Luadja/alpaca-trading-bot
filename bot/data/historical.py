@@ -62,6 +62,7 @@ class HistoricalData:
         timeframe: TimeFrame,
         lookback_days: int = 400,
         use_cache: bool = True,
+        feed: str | None = None,
     ) -> pd.DataFrame:
         cache_file = self.cache_dir / f"{symbol}_{timeframe.value}.parquet"
         if use_cache and cache_file.exists():
@@ -76,7 +77,7 @@ class HistoricalData:
             timeframe=timeframe,
             start=start,
             end=end,
-            feed=self.feed,
+            feed=self.feed if feed is None else _feed(feed),
             # Split/dividend-adjusted so indicators see a continuous series across
             # corporate actions (raw bars would show fake gaps at splits).
             adjustment=Adjustment.ALL,
