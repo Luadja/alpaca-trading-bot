@@ -127,11 +127,13 @@ MFI 14, MFI bands 30/80, divergence as confidence (not required), pivots 3/3, lo
 - [x] **Phase 4 — Risk.** Sizing, gates, kill switch (tested).
 - [x] **Phase 5 — Execution & state.** Idempotent orders, SQLite ledger, reconcile.
 - [x] **Phase 6 — Backtest harness.** `backtesting.py` + multi-symbol parameter sweep.
-- [~] **Phase 7 — Tune & validate (CURRENT).** Sweep ✅, out-of-sample/walk-forward + regime
-      tests ✅, trend/regime filter added and validated ✅ (now the default). The filter cut the
-      2022 bear drawdown ~73% and improved OOS robustness (see §10). Still does not beat
-      buy-and-hold and is low-activity. Next: intraday timeframe sweep, then paper.
-- [ ] **Phase 8 — Paper run.** ~2 weeks live on paper; watch reconnects, partial fills, restart recovery.
+- [x] **Phase 7 — Tune & validate.** Sweep ✅, walk-forward + regime tests ✅, trend filter
+      (now default) ✅, intraday sweep ✅. Conclusion: **no tradeable edge** on daily/1H/15M
+      (see §10); the infra is validated and reusable. Strategy direction is now an open
+      decision (§11).
+- [ ] **Phase 8 — Paper run (optional).** Run the daily + trend-filter config on paper to
+      exercise live mechanics (reconnects, partial fills, restart recovery) as a learning
+      exercise — no edge expected — OR pause until a new strategy is chosen.
 - [ ] **Phase 9 — Go live (small).** `ALPACA_PAPER=false`, capital you can lose, ramp slowly.
 - [ ] **Phase 10 — Deploy.** Linux VPS under systemd (`Restart=on-failure`) or Docker
       (`restart: unless-stopped`); streaming needs a persistent process.
@@ -197,18 +199,46 @@ Re-ran the same walk-forward with `use_trend_filter=True` (longs only when price
   4yr OOS → thin statistical power). Positioning: a conservative, drawdown-controlled
   strategy, not a market-beater. More activity/signal is the job of an intraday timeframe.
 
+### Intraday sweep (1H / 15M) — does more activity help? No.
+
+Ran the threshold grid (raw oscillator, filter OFF) on shorter timeframes:
+
+- **1-Hour (2yr, 10-symbol basket):** activity jumped as hoped — active `div=N` configs
+  trade 70–180× (vs ~13 daily) — but returns went flat-to-negative with **negative Sharpe
+  (−0.1 to −0.3)** and −22% to −27% drawdowns; none meaningfully beat B&H (+55.7%).
+- **15-Min (1yr):** worse — `div=N` configs trade 145–370× with **Sharpe −0.7 to −2.0**,
+  **win rate falling below 50%** (45–48%) as activity rises, drawdowns to −28.5%. Only the
+  near-inactive `div=Y` sets were marginally positive (≈noise).
+- **Conclusion: no tradeable edge intraday.** Frequency didn't surface an edge — it exposed
+  that there isn't one: net of churn/costs the signal is random-to-negative, and gets *worse*
+  with more trading.
+
+### Edge assessment (overall — conclusion of Phase 7)
+
+The StochRSI+MFI mean-reversion strategy shows **no demonstrable edge** on daily, 1H, or 15M
+bars, across a diversified basket and out-of-sample windows. The trend filter makes the daily
+version *safer* (drawdown control) but adds no alpha. This is the expected fate of most retail
+TA rules under honest walk-forward validation — and catching it in backtest/paper, not with
+real money, is the win. **What is validated and reusable: the infrastructure** — data layer,
+pluggable pure-`Strategy` interface, risk/kill-switch, idempotent execution, and the backtest +
+walk-forward harness. Swapping in a new strategy is a localized change behind `Strategy`.
+
 ---
 
 ## 11. Open decisions & next steps
 
-1. ~~Add a trend / regime filter~~ ✅ **Done** — per-symbol price > 200-SMA, now the default
-   (`validate.py --trend-filter` reproduces the result). A market-wide SPY-regime gate is a
-   possible follow-up (needs cross-symbol data into the strategy).
-2. ~~Keep the conservative default params~~ ✅ confirmed more robust than the looser set.
-3. **Intraday sweep (top priority now)** — 15Min / 1Hour, where this signal style is more
-   natural and trades more often (the current edge is real but too low-activity for confidence).
-4. **Paper run (Phase 8)** once an intraday/daily config is settled.
-5. Decide if/when to wire the **websocket stream** (Phase 8+) vs. staying on polling.
+Phase 7 settled the strategy question: **no tradeable edge** on this signal at any timeframe.
+The build is sound; the rule isn't profitable. Direction is now the user's call:
+
+1. **Paper-trade the daily + trend-filter config** to exercise the live stack (orders,
+   reconnect, fills, kill switch) as a learning exercise — eyes open that it won't beat B&H.
+2. **Try a different strategy family** behind the existing `Strategy` interface — e.g.
+   trend/momentum (these names trend), pairs/stat-arb, or a regime-specific approach. Fresh
+   research; most rules still fail validation.
+3. **Pause** — the bot + validation harness are done and reusable; revisit strategy later.
+
+Deliberately **NOT** doing: more threshold/parameter hunting on StochRSI+MFI — that path only
+overfits. The honest move is to change the *strategy*, not keep tuning this one.
 
 ---
 
