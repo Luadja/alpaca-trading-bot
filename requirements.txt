@@ -1,0 +1,26 @@
+# Core — official Alpaca SDK (alpaca-trade-api is DEPRECATED, do not use it)
+alpaca-py>=0.42,<1.0
+
+# Data / numerics
+pandas>=2.0
+numpy>=1.26
+
+# Config & secrets
+pydantic-settings>=2.0
+python-dotenv>=1.0
+
+# Scheduling for the live loop
+APScheduler>=3.10
+
+# Timezone data (Windows has no system tz DB) for the trading-day rollover
+tzdata>=2024.1
+
+# Backtesting (research only — no live trading)
+backtesting>=0.6
+
+# --- Optional ---
+# Maintained pandas-ta fork (the original pandas-ta is end-of-life). The bot implements
+# StochRSI / MFI / divergence itself, so this is only needed if you want extra indicators:
+#   pip install pandas-ta-classic
+#
+# TA-Lib now ships official Windows wheels (since Aug 2025): pip install TA-Lib

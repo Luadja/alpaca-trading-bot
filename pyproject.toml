@@ -1,0 +1,15 @@
+[project]
+name = "alpaca-trading-bot"
+version = "0.1.0"
+description = "Equities trading bot on Alpaca: Stochastic RSI + Money Flow Index with divergence confirmation"
+requires-python = ">=3.10"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

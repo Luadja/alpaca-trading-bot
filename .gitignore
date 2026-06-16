@@ -1,0 +1,25 @@
+# Secrets — NEVER commit real keys
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Data / state (local caches and the live ledger)
+data/cache/
+*.parquet
+*.sqlite
+*.db
+*.log
+
+# Backtest artifacts
+backtests/output/
+*.html
