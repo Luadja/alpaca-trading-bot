@@ -223,22 +223,44 @@ real money, is the win. **What is validated and reusable: the infrastructure** �
 pluggable pure-`Strategy` interface, risk/kill-switch, idempotent execution, and the backtest +
 walk-forward harness. Swapping in a new strategy is a localized change behind `Strategy`.
 
+### Pivot: trend-following strategy (validated — the better path)
+
+Per the §11 decision, swapped the signal family to **trend-following** (dual-SMA
+golden/death cross, `bot/strategy/trend_momentum.py`) behind the same `Strategy` interface,
+and ran the identical sweep + walk-forward. The **50/200 golden cross** (the strategy
+default) is the robust winner:
+
+- **Robust out-of-sample:** IS→OOS Sharpe **0.47 → 0.35** (stable, vs mean-reversion's
+  0.21→0.10), +101.7% OOS, and beats buy-and-hold on **33% of names (5/15)** vs 7% (1/15).
+- **Real bear protection:** 2022 = **−3.8% (DD −4.7%)**, beating B&H on 73% of names that
+  year — the death cross exits the downtrend instead of buying into it (mean-reversion lost
+  −14.7%; a *fast* 20/100 trend follower got whipsawed for −13.4%).
+- Rides trends: 2020 COVID +10.8% (Sharpe 0.87), 2023-24 +55.5%, 2025-26 +41.4%.
+
+Caveats: it does **not** beat B&H on the strongest single trenders (exiting pullbacks gives
+up upside); **low trade frequency** (~0.8–2.6 trades/window) is inherent to trend-following →
+thin statistical power; max DD ~−26% (the 200-SMA lags, so gains are given back before the
+death-cross exit). Net: a defensible, drawdown-aware strategy with stable OOS behaviour — the
+first config in this study with a plausible edge.
+
+Tooling note: the validator's `--min-trades` filter (built for the oscillator) wrongly
+excludes low-frequency trend configs — use `--min-trades 0-1` for trend strategies. The
+backtest tooling is now strategy-agnostic via `backtests/strategies.py` (`--strategy`).
+
 ---
 
 ## 11. Open decisions & next steps
 
-Phase 7 settled the strategy question: **no tradeable edge** on this signal at any timeframe.
-The build is sound; the rule isn't profitable. Direction is now the user's call:
+Phase 7 retired the mean-reversion strategy (no edge). The pivot to **trend-following** (§10)
+validated well: the 50/200 golden cross is robust OOS, protects in bears, and beats B&H on a
+third of the basket. Open decisions:
 
-1. **Paper-trade the daily + trend-filter config** to exercise the live stack (orders,
-   reconnect, fills, kill switch) as a learning exercise — eyes open that it won't beat B&H.
-2. **Try a different strategy family** behind the existing `Strategy` interface — e.g.
-   trend/momentum (these names trend), pairs/stat-arb, or a regime-specific approach. Fresh
-   research; most rules still fail validation.
-3. **Pause** — the bot + validation harness are done and reusable; revisit strategy later.
-
-Deliberately **NOT** doing: more threshold/parameter hunting on StochRSI+MFI — that path only
-overfits. The honest move is to change the *strategy*, not keep tuning this one.
+1. **Make trend-following the bot's live default?** `run.py` still wires `StochRsiMfiStrategy`;
+   the validated choice is `TrendMomentumStrategy` (50/200). Optionally make the strategy
+   config-selectable (mirrors the backtest registry).
+2. **Strengthen the trend strategy** — add a trailing-stop / faster exit to cut the ~−26% max
+   DD (the 200-SMA lags on the way down), and validate on more symbols to thicken the sample.
+3. **Paper run (Phase 8)** with the chosen strategy.
 
 ---
 

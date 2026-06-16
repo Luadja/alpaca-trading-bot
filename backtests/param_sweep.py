@@ -1,15 +1,16 @@
-"""Parameter sweep across a basket of symbols.
+"""Parameter sweep across a basket of symbols, for any registered strategy.
 
-Backtests a grid of StochRSI/MFI thresholds (and divergence on/off) over several
-symbols, then ranks parameter sets by their MEAN performance across the basket so
-you don't overfit to a single name. Uses the full-market SIP feed for bar fidelity
-(free for history >15 min old; falls back to IEX) and split/dividend-adjusted bars.
+Backtests a strategy's param grid over several symbols, then ranks parameter sets by
+their MEAN performance across the basket so you don't overfit to a single name. Uses
+the full-market SIP feed for bar fidelity (free for history >15 min old; falls back to
+IEX) and split/dividend-adjusted bars.
 
 Research only — same caveats as any backtest (optimistic fills, no live slippage).
 
 Usage:
     python -m backtests.param_sweep
-    python -m backtests.param_sweep --symbols AAPL MSFT SPY --years 4 --timeframe 1Day
+    python -m backtests.param_sweep --strategy trend_momentum --timeframe 1Day
+    python -m backtests.param_sweep --symbols AAPL MSFT SPY --years 4
 """
 
 from __future__ import annotations
@@ -23,46 +24,13 @@ from alpaca.common.exceptions import APIError
 from backtesting import Backtest
 
 from backtests.backtest_stoch_rsi_mfi import SrsiMfiBacktest
+from backtests.strategies import REGISTRY
 from bot.config import load_settings
 from bot.data.historical import HistoricalData, parse_timeframe
-from bot.strategy import StochRsiMfiParams, compute_signals
 
 warnings.filterwarnings("ignore")
 
 DEFAULT_BASKET = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM", "SPY", "QQQ"]
-
-
-def build_grid() -> list[StochRsiMfiParams]:
-    """Symmetric oversold/overbought bands + divergence on/off. 3x3x2 = 18 sets."""
-    grid = []
-    for stoch_os in (20, 30, 40):
-        for mfi_os in (25, 35, 45):
-            for div_required in (False, True):
-                grid.append(
-                    StochRsiMfiParams(
-                        stoch_oversold=stoch_os,
-                        stoch_overbought=100 - stoch_os,
-                        mfi_oversold=mfi_os,
-                        mfi_overbought=100 - mfi_os,
-                        use_divergence=True,
-                        divergence_required=div_required,
-                        # Pin filter OFF so the sweep measures the raw oscillator,
-                        # independent of the shipped default (which is now ON).
-                        use_trend_filter=False,
-                    )
-                )
-    return grid
-
-
-def pkey(p: StochRsiMfiParams) -> str:
-    # Encode the trend dimension too, so output discloses filter state and mixed-trend
-    # grids can't collide on the same cache key.
-    trend = f"tf{int(p.trend_sma)}" if p.use_trend_filter else "tf-off"
-    return (
-        f"stoch{int(p.stoch_oversold)}/{int(p.stoch_overbought)} "
-        f"mfi{int(p.mfi_oversold)}/{int(p.mfi_overbought)} "
-        f"div={'Y' if p.divergence_required else 'N'} {trend}"
-    )
 
 
 def _bt_df(df: pd.DataFrame, signals: pd.Series) -> pd.DataFrame:
@@ -74,13 +42,17 @@ def _bt_df(df: pd.DataFrame, signals: pd.Series) -> pd.DataFrame:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="StochRSI+MFI parameter sweep")
+    ap = argparse.ArgumentParser(description="Parameter sweep across a basket")
+    ap.add_argument("--strategy", choices=list(REGISTRY), default="stoch_rsi_mfi")
     ap.add_argument("--symbols", nargs="*", default=DEFAULT_BASKET)
     ap.add_argument("--years", type=float, default=3.0)
     ap.add_argument("--timeframe", default="1Day")
     ap.add_argument("--cash", type=float, default=100_000.0)
     ap.add_argument("--commission", type=float, default=0.0005)
     args = ap.parse_args()
+
+    entry = REGISTRY[args.strategy]
+    compute, build_grid, pkey = entry["signals"], entry["grid"], entry["pkey"]
 
     settings = load_settings()
     data = HistoricalData(settings)
@@ -105,14 +77,14 @@ def main() -> None:
             print(f"  skip {sym}: only {len(df)} bars")
             continue
         bars[sym] = df
-    print(f"Loaded {len(bars)} symbols via {feed_used} feed, {len(build_grid())} param sets each "
-          f"({args.years}yr {args.timeframe}).\n")
-
     grid = build_grid()
+    print(f"[{args.strategy}] loaded {len(bars)} symbols via {feed_used} feed, "
+          f"{len(grid)} param sets each ({args.years}yr {args.timeframe}).\n")
+
     rows = []
     for sym, df in bars.items():
         for p in grid:
-            signals = compute_signals(df, p)["signal"]
+            signals = compute(df, p)["signal"]
             stats = Backtest(
                 _bt_df(df, signals), SrsiMfiBacktest, cash=args.cash, commission=args.commission
             ).run()
@@ -154,7 +126,7 @@ def main() -> None:
     print(header)
     print("-" * len(header))
     for _, r in agg.iterrows():
-        win = f"{r.mean_win:.0f}" if not np.isnan(r.mean_win) else "—"
+        win = f"{r.mean_win:.0f}" if not np.isnan(r.mean_win) else "-"
         print(
             f"{r.key:<34} {r.mean_ret:>7.1f} {r.mean_sharpe:>7.2f} "
             f"{r.avg_trades:>7.1f} {win:>6} {r.mean_dd:>7.1f} {r.beat_bh_pct:>8.0f}"

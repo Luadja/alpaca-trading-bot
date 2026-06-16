@@ -31,10 +31,10 @@ from alpaca.common.exceptions import APIError
 from backtesting import Backtest
 
 from backtests.backtest_stoch_rsi_mfi import SrsiMfiBacktest
-from backtests.param_sweep import _bt_df, build_grid, pkey
+from backtests.param_sweep import _bt_df
+from backtests.strategies import REGISTRY
 from bot.config import load_settings
 from bot.data.historical import HistoricalData, parse_timeframe
-from bot.strategy import StochRsiMfiParams, compute_signals
 
 warnings.filterwarnings("ignore")
 
@@ -110,6 +110,7 @@ def _row(label: str, m: dict) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Out-of-sample validation")
+    ap.add_argument("--strategy", choices=list(REGISTRY), default="stoch_rsi_mfi")
     ap.add_argument("--symbols", nargs="*", default=BASKET)
     ap.add_argument("--years-back", type=float, default=8.0)
     ap.add_argument("--is-end", default="2022-01-01", help="in-sample/out-of-sample cutoff")
@@ -121,9 +122,13 @@ def main() -> None:
         help="min avg in-sample trades for a param set to be eligible as 'best' "
         "(ranking by Sharpe alone rewards configs that barely trade)",
     )
-    ap.add_argument("--trend-filter", action="store_true", help="enable the price>SMA trend filter")
+    ap.add_argument("--trend-filter", action="store_true",
+                    help="(stoch_rsi_mfi only) enable the price>SMA trend filter")
     ap.add_argument("--trend-sma", type=int, default=200)
     args = ap.parse_args()
+
+    entry = REGISTRY[args.strategy]
+    compute, build_grid, pkey = entry["signals"], entry["grid"], entry["pkey"]
 
     settings = load_settings()
     data = HistoricalData(settings)
@@ -154,13 +159,15 @@ def main() -> None:
     print(f"In-sample: {is_start} -> {is_end}  |  Out-of-sample: {oos_start} -> now\n")
 
     grid = build_grid()
-    # Baseline is the raw oscillator (filter OFF), independent of the shipped default;
-    # --trend-filter flips it ON across the whole experiment.
-    default_p = StochRsiMfiParams(use_trend_filter=False)
-    if args.trend_filter:
+    default_p = entry["default"]()
+    # --trend-filter only applies to a strategy that has that field (stoch_rsi_mfi).
+    has_trend_field = any(f.name == "use_trend_filter" for f in dataclasses.fields(default_p))
+    if args.trend_filter and has_trend_field:
         grid = [dataclasses.replace(p, use_trend_filter=True, trend_sma=args.trend_sma) for p in grid]
         default_p = dataclasses.replace(default_p, use_trend_filter=True, trend_sma=args.trend_sma)
         print(f"Trend filter ON: longs only when price > {args.trend_sma}-bar SMA.\n")
+    elif args.trend_filter:
+        print(f"  (--trend-filter ignored: {args.strategy} has no use_trend_filter param)\n")
 
     # Compute every (symbol, param) signal once; reuse across all windows.
     sig_cache: dict[tuple[str, str], pd.Series] = {}
@@ -168,12 +175,12 @@ def main() -> None:
     for sym, df in bars.items():
         for p in grid:
             key = pkey(p)
-            sig = compute_signals(df, p)["signal"]
+            sig = compute(df, p)["signal"]
             sig_cache[(sym, key)] = sig
             stats = _run_window(df, sig, is_start, is_end, args.cash, args.commission)
             if stats is not None:
                 is_records.setdefault(key, []).append(_metrics(stats))
-        sig_cache[(sym, "DEFAULT")] = compute_signals(df, default_p)["signal"]
+        sig_cache[(sym, "DEFAULT")] = compute(df, default_p)["signal"]
 
     is_agg = {k: _aggregate(v) for k, v in is_records.items()}
     ranked = sorted(

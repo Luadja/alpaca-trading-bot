@@ -2,5 +2,13 @@
 
 from bot.strategy.base import Strategy
 from bot.strategy.stoch_rsi_mfi import StochRsiMfiParams, StochRsiMfiStrategy, compute_signals
+from bot.strategy.trend_momentum import TrendMomentumParams, TrendMomentumStrategy
 
-__all__ = ["Strategy", "StochRsiMfiStrategy", "StochRsiMfiParams", "compute_signals"]
+__all__ = [
+    "Strategy",
+    "StochRsiMfiStrategy",
+    "StochRsiMfiParams",
+    "compute_signals",
+    "TrendMomentumStrategy",
+    "TrendMomentumParams",
+]
