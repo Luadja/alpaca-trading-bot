@@ -126,8 +126,10 @@ MFI 14, MFI bands 30/80, divergence as confidence (not required), pivots 3/3, lo
 - [x] **Phase 4 — Risk.** Sizing, gates, kill switch (tested).
 - [x] **Phase 5 — Execution & state.** Idempotent orders, SQLite ledger, reconcile.
 - [x] **Phase 6 — Backtest harness.** `backtesting.py` + multi-symbol parameter sweep.
-- [ ] **Phase 7 — Tune & validate (CURRENT).** Out-of-sample / walk-forward, regime tests,
-      intraday timeframe; lock defaults only after out-of-sample confirmation.
+- [~] **Phase 7 — Tune & validate (CURRENT).** Sweep ✅ and out-of-sample/walk-forward +
+      regime tests ✅ done (`backtests/validate.py`). Result: **no validated edge on daily
+      bars and a dangerous bear-market profile** (see §10). Next: add a trend/regime filter
+      and re-validate before any intraday work or default changes.
 - [ ] **Phase 8 — Paper run.** ~2 weeks live on paper; watch reconnects, partial fills, restart recovery.
 - [ ] **Phase 9 — Go live (small).** `ALPACA_PAPER=false`, capital you can lose, ramp slowly.
 - [ ] **Phase 10 — Deploy.** Linux VPS under systemd (`Restart=on-failure`) or Docker
@@ -158,14 +160,37 @@ MFI 14, MFI bands 30/80, divergence as confidence (not required), pivots 3/3, lo
 - ⚠️ These rankings are from one bull window — **do not adopt as defaults without
   out-of-sample validation** (overfitting risk).
 
+### Out-of-sample / walk-forward validation (8yr, 15-symbol diversified basket)
+
+In-sample 2018-06→2021-12 (picks params), out-of-sample 2022-01→now (tests them):
+
+- **No validated edge.** The best *active* in-sample config (`stoch40/60 mfi45/55 div=N`)
+  degraded out-of-sample (Sharpe **0.21 → 0.10**, win 65%→59%, DD −24%→−28%) and beat
+  buy-and-hold on only **1 of 15** symbols in both windows.
+- **Bear-market blow-up (the key risk).** In the 2022 bear it returned **−14.7%
+  (Sharpe −0.89, 40% win)** — a long-only "buy the oversold dip" strategy catches falling
+  knives in a downtrend. It only "beat B&H" there because B&H fell further; that's
+  under-participation, not capital protection.
+- **The conservative default is more robust** than the looser "optimized" config
+  (default Sharpe 0.16→0.13 stable, DD ~−18% vs −28%) — so loosening thresholds is *not*
+  an improvement once judged out-of-sample.
+- **Ranking by Sharpe alone is gamed by inactivity** — the unfiltered IS-best traded
+  ~0.3 times in 3.5 years. `validate.py` now applies a `--min-trades` eligibility filter.
+- `divergence_required=True` confirmed near-inert across 8 years → keep divergence as a
+  confidence booster only.
+- **Verdict:** do **not** trade this as-is. The signal works in up/sideways regimes but
+  must not buy dips in sustained downtrends.
+
 ---
 
 ## 11. Open decisions & next steps
 
-1. **Out-of-sample / walk-forward validation** (recommended next) — include the 2022
-   drawdown/sideways tape and range-bound names; that's the regime this strategy should suit.
-2. **Intraday sweep** (15Min / 1Hour) — more natural for this signal style; more trades.
-3. **Adopt looser defaults** only if they survive (1).
+1. **Add a trend / regime filter (top priority).** Directly fixes the 2022 falling-knife
+   blow-up: only take long mean-reversion entries when the trend is up — e.g. price above
+   its 200-day SMA, and/or only when SPY is above its own 200DMA. Then re-run `validate.py`
+   to confirm it removes the bear-market drawdown while keeping up/sideways participation.
+2. **Keep the conservative default params** — they validated more robustly than the looser set.
+3. **Intraday sweep** (15Min / 1Hour) — only after (1); more natural for this signal style.
 4. Decide if/when to wire the **websocket stream** (Phase 8+) vs. staying on polling.
 
 ---
