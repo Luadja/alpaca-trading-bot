@@ -18,6 +18,10 @@ tzdata>=2024.1
 # Backtesting (research only — no live trading)
 backtesting>=0.6
 
+# Dashboard (streamlit run dashboard/app.py)
+streamlit>=1.36
+plotly>=5.22
+
 # --- Optional ---
 # Maintained pandas-ta fork (the original pandas-ta is end-of-life). The bot implements
 # StochRSI / MFI / divergence itself, so this is only needed if you want extra indicators:

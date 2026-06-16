@@ -142,12 +142,14 @@ MFI 14, MFI bands 30/80, divergence as confidence (not required), pivots 3/3, lo
 
 ## 9. Current status
 
-- ✅ Skeleton built, reviewed, committed; indicator math + every `alpaca-py` call verified.
-- ✅ **21/21 tests pass**; all modules compile.
-- ✅ Paper connection verified (equity $100k, data flowing); backtest + sweep + walk-forward
-  validation all run end to end.
-- ✅ Trend filter implemented, validated, and made the **default** (Phase 7).
-- ⏳ Next: intraday timeframe sweep, then paper run (Phase 8).
+- ✅ Validated platform: data, pluggable `Strategy` registry, risk/kill-switch, idempotent
+  execution, SQLite ledger, backtest + walk-forward harness, and a Streamlit dashboard.
+- ✅ **30/30 tests pass**; all modules compile; live data path smoke-tested on paper.
+- ✅ Strategy is config-selectable (`BOT_STRATEGY`); default `trend_momentum` (validated);
+  `stoch_rsi_mfi` retired but kept for comparison.
+- ✅ Phase 7 complete: mean-reversion (no edge) → trend-following (validated), incl. the
+  intraday sweep and a trailing-stop experiment (reverted).
+- ⏳ Next: paper run (Phase 8) — mind the entry-semantics note in §11.
 
 ---
 
@@ -265,14 +267,18 @@ Phase 7 retired the mean-reversion strategy (no edge). The pivot to **trend-foll
 validated well: the 50/200 golden cross is robust OOS, protects in bears, and beats B&H on a
 third of the basket. Open decisions:
 
-1. **Make trend-following the bot's live default?** `run.py` still wires `StochRsiMfiStrategy`;
-   the validated choice is `TrendMomentumStrategy` (50/200, no trailing stop). Optionally make
-   the strategy config-selectable (mirrors the backtest registry).
+1. ✅ **Done** — trend-following is the live default; strategy is config-selectable via
+   `BOT_STRATEGY` (registry in `bot/strategy/__init__.py`); a Streamlit dashboard was added
+   (`dashboard/app.py`).
 2. ~~Trailing-stop exit~~ → tried and **reverted** (cut returns/edge more than DD; §10). DD
    control belongs at the portfolio level (position sizing / max exposure), already in the risk
-   layer. Remaining strengthening: validate on more symbols to thicken the sample, or a
-   market-regime (SPY) gate.
-3. **Paper run (Phase 8)** with the chosen strategy.
+   layer. Remaining strengthening: more symbols to thicken the sample, or a market-regime (SPY) gate.
+3. **Trend entry semantics — decide before live.** Entries fire on the cross *event* (the
+   golden-cross bar), and the live lookback must be long enough (now 800 days) for the 200-SMA
+   to be valid before recent crosses. A freshly-started bot that's already mid-trend won't
+   enter until the *next* cross. To adopt an in-progress uptrend on startup, add a state-based
+   entry (long when fast>slow and flat) — a deliberate choice, not done yet.
+4. **Paper run (Phase 8)** with `trend_momentum`.
 
 ---
 

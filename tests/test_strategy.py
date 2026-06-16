@@ -109,3 +109,14 @@ def test_missing_columns_raises():
     except ValueError:
         return
     raise AssertionError("expected ValueError for missing OHLCV columns")
+
+
+def test_make_strategy_registry():
+    import pytest
+
+    from bot.strategy import StochRsiMfiStrategy, TrendMomentumStrategy, make_strategy
+
+    assert isinstance(make_strategy("trend_momentum"), TrendMomentumStrategy)
+    assert isinstance(make_strategy("stoch_rsi_mfi"), StochRsiMfiStrategy)
+    with pytest.raises(ValueError):
+        make_strategy("does_not_exist")

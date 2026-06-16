@@ -14,7 +14,7 @@ import argparse
 from bot.config import load_settings
 from bot.data.historical import HistoricalData, parse_timeframe
 from bot.execution.broker import Broker
-from bot.strategy import StochRsiMfiStrategy
+from bot.strategy import make_strategy
 
 
 def main() -> None:
@@ -24,7 +24,7 @@ def main() -> None:
     args = ap.parse_args()
 
     settings = load_settings()
-    print(f"Paper mode: {settings.paper}   Feed: {settings.feed}")
+    print(f"Paper mode: {settings.paper}   Feed: {settings.feed}   Strategy: {settings.strategy}")
 
     broker = Broker(settings)
     acct = broker.account()
@@ -37,7 +37,7 @@ def main() -> None:
     data = HistoricalData(settings)
     df = data.get_bars(args.symbol, parse_timeframe(settings.timeframe), lookback_days=500, use_cache=False)
     print(f"\nFetched {len(df)} bars for {args.symbol}.")
-    strategy = StochRsiMfiStrategy()
+    strategy = make_strategy(settings.strategy)
     if not df.empty:
         print(f"Latest close: {df['close'].iloc[-1]:.2f}")
         if len(df) < strategy.params.min_bars:

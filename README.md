@@ -1,9 +1,12 @@
-# Alpaca Trading Bot — StochRSI + MFI with divergence
+# Alpaca Trading Bot
 
 An equities trading bot for [Alpaca](https://alpaca.markets) built on the official
-**`alpaca-py`** SDK. The strategy combines **Stochastic RSI** and the **Money Flow
-Index (MFI)** with optional **price/indicator divergence** confirmation. Paper-first,
-runs locally.
+**`alpaca-py`** SDK — a pluggable strategy platform with a backtest + walk-forward
+validation harness and a Streamlit dashboard. Paper-first, runs locally.
+
+The default strategy is **trend-following** (50/200 golden/death cross), chosen after a
+mean-reversion strategy (StochRSI + MFI) was validated and found to have no edge. See
+[docs/PLAN.md](docs/PLAN.md) for the full research story.
 
 > ⚠️ **Not financial advice.** Algorithmic trading can lose money fast. Run on a
 > **paper** account for at least ~2 weeks before risking a cent, then start tiny.
@@ -22,20 +25,21 @@ runs locally.
   `pandas-ta-classic` if you want it). This bot implements its indicators directly,
   so neither is required.
 
-## The strategy
+## Strategies
 
-Long-only (shorting adds margin/borrow complexity — add it later):
+Long-only. Select with `BOT_STRATEGY` in `.env`; each is pure (data in → signals out)
+and runs identically in the live bot and the backtest.
 
-| | Condition |
-|---|---|
-| **Enter long** | StochRSI %K crosses **above** %D while oversold, **and** MFI is oversold (volume confirms buyers) |
-| **Exit long** | StochRSI %K crosses **below** %D while overbought, **or** MFI overbought |
-| **Trend filter** | **On by default** — longs only when price is above its 200-day SMA, so the bot doesn't buy dips in a downtrend. Validated to cut the 2022 bear drawdown ~73% (see [docs/PLAN.md](docs/PLAN.md) §10). Disable with `use_trend_filter=False`. |
-| **Divergence** | Bullish divergence (price lower-low + MFI higher-low) raises confidence to 1.0; set `divergence_required=True` to make it mandatory for entries |
+- **`trend_momentum`** (default, validated) — go long on a 50/200 SMA golden cross,
+  exit on the death cross. Robust out-of-sample; protects capital in bear markets
+  ([trend_momentum.py](bot/strategy/trend_momentum.py)). Optional trailing stop and
+  regime/ROC filters (off by default — the trailing stop validated *worse*; see PLAN §10).
+- **`stoch_rsi_mfi`** (retired, kept for comparison) — Stochastic RSI + Money Flow Index
+  mean-reversion with an optional 200-SMA trend filter and divergence confirmation. No
+  validated edge; included to reproduce the research ([stoch_rsi_mfi.py](bot/strategy/stoch_rsi_mfi.py)).
 
-All thresholds live in [`StochRsiMfiParams`](bot/strategy/stoch_rsi_mfi.py). The same
-`compute_signals()` runs in both the live bot and the backtest, so what you test is
-what you trade.
+Validate any strategy walk-forward before trusting it:
+`python -m backtests.validate --strategy trend_momentum`.
 
 ## Project layout
 
@@ -44,15 +48,16 @@ bot/
   config.py            # typed settings from .env (pydantic-settings)
   models.py            # SignalDecision / enums (pure)
   indicators/          # stoch_rsi, money_flow (MFI), divergence  (pure)
-  strategy/            # StochRSI+MFI signal logic                (pure)
+  strategy/            # trend_momentum + stoch_rsi_mfi + registry (pure)
   risk/                # sizing, gates, daily-loss KILL SWITCH    (pure)
   execution/broker.py  # alpaca-py TradingClient, idempotent orders
   data/                # historical bars (+Parquet cache) & live stream
   state/ledger.py      # SQLite order ledger + reconciliation
   run.py               # orchestrator: data -> strategy -> risk -> execution
-backtests/             # backtesting.py harness
+backtests/             # backtesting.py harness, param sweep, walk-forward validate
+dashboard/             # Streamlit dashboard (app.py) + Plotly charts
 scripts/smoke_test.py  # verify paper connection + data (read-only)
-tests/                 # pytest — indicators, strategy, kill switch
+tests/                 # pytest — indicators, strategies, kill switch, charts
 ```
 
 ## Setup (Windows / PowerShell)
@@ -81,6 +86,9 @@ python -m bot.run --once
 
 # 4. Run continuously, polling every 5 minutes
 python -m bot.run --interval 300
+
+# 5. Dashboard — account, positions, signals, charts, order ledger
+streamlit run dashboard/app.py
 
 # Tests (no keys/network needed — pure indicator/strategy/risk math)
 pytest

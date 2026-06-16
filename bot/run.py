@@ -29,7 +29,7 @@ from bot.logging_setup import setup_logging
 from bot.models import SignalDecision, SignalType
 from bot.risk import RiskConfig, RiskManager
 from bot.state import Ledger
-from bot.strategy import StochRsiMfiParams, StochRsiMfiStrategy
+from bot.strategy import make_strategy
 
 try:
     from zoneinfo import ZoneInfo
@@ -49,14 +49,17 @@ class TradingBot:
         self.log = setup_logging()
         self.broker = Broker(settings)
         self.data = HistoricalData(settings)
-        self.strategy = StochRsiMfiStrategy(StochRsiMfiParams())
+        self.strategy = make_strategy(settings.strategy)
         self.ledger = Ledger(settings.ledger_path)
         self.timeframe = parse_timeframe(settings.timeframe)
 
         account = self.broker.account()
         self.risk = RiskManager(RiskConfig(), day_start_equity=account.equity)
         self._session_date = _trading_date()
-        self.log.info("Started. equity=%.2f paper=%s", account.equity, settings.paper)
+        self.log.info(
+            "Started. equity=%.2f paper=%s strategy=%s",
+            account.equity, settings.paper, settings.strategy,
+        )
 
     def step(self) -> None:
         account = self.broker.account()
@@ -88,7 +91,9 @@ class TradingBot:
                 self.log.exception("error evaluating %s", symbol)
 
     def _evaluate_symbol(self, symbol, equity, positions, running_exposure) -> float:
-        df = self.data.get_bars(symbol, self.timeframe, lookback_days=500, use_cache=False)
+        # ~550 daily bars: enough that the 200-SMA is valid well before recent crosses
+        # (a short window can miss the last golden/death cross). Reduce for sub-daily.
+        df = self.data.get_bars(symbol, self.timeframe, lookback_days=800, use_cache=False)
         required = max(self.settings.warmup_bars, self.strategy.params.min_bars)
         if df.empty or len(df) < required:
             self.log.warning(

@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     symbols: list[str] = Field(default=["AAPL", "MSFT"], validation_alias="BOT_SYMBOLS")
     timeframe: str = Field(default="1Day", validation_alias="BOT_TIMEFRAME")
 
+    # Which strategy the live bot trades: "trend_momentum" (validated default) or
+    # "stoch_rsi_mfi" (retired mean-reversion — kept for comparison).
+    strategy: str = Field(default="trend_momentum", validation_alias="BOT_STRATEGY")
+
     # Absolute floor for bars before the bot acts. The live guard uses
     # max(warmup_bars, StochRsiMfiParams.min_bars), so changing trend_sma/timeframe can't
     # silently invalidate the regime gate — this is just a lower bound.

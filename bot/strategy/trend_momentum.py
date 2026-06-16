@@ -109,6 +109,10 @@ class TrendMomentumStrategy(Strategy):
     def __init__(self, params: TrendMomentumParams | None = None) -> None:
         self.params = params or TrendMomentumParams()
 
+    def signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Full indicator + signal frame (for analysis / plotting)."""
+        return compute_signals(df, self.params)
+
     def generate(self, df: pd.DataFrame, symbol: str) -> SignalDecision:
         self._validate(df)
         signals = compute_signals(df, self.params)
