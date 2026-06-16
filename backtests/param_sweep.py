@@ -26,11 +26,10 @@ from backtesting import Backtest
 from backtests.backtest_stoch_rsi_mfi import SrsiMfiBacktest
 from backtests.strategies import REGISTRY
 from bot.config import load_settings
+from backtests.universe import resolve_universe
 from bot.data.historical import HistoricalData, parse_timeframe
 
 warnings.filterwarnings("ignore")
-
-DEFAULT_BASKET = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM", "SPY", "QQQ"]
 
 
 def _bt_df(df: pd.DataFrame, signals: pd.Series) -> pd.DataFrame:
@@ -44,7 +43,9 @@ def _bt_df(df: pd.DataFrame, signals: pd.Series) -> pd.DataFrame:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Parameter sweep across a basket")
     ap.add_argument("--strategy", choices=list(REGISTRY), default="stoch_rsi_mfi")
-    ap.add_argument("--symbols", nargs="*", default=DEFAULT_BASKET)
+    ap.add_argument("--universe", default="etf",
+                    help="'etf' (survivorship-free, default), 'megacap' (biased), or a CSV path")
+    ap.add_argument("--symbols", nargs="*", default=None, help="explicit symbols (overrides --universe)")
     ap.add_argument("--years", type=float, default=3.0)
     ap.add_argument("--timeframe", default="1Day")
     ap.add_argument("--cash", type=float, default=100_000.0)
@@ -53,6 +54,14 @@ def main() -> None:
 
     entry = REGISTRY[args.strategy]
     compute, build_grid, pkey = entry["signals"], entry["grid"], entry["pkey"]
+
+    if args.symbols:
+        symbols, windows, biased = args.symbols, None, True
+    else:
+        symbols, windows, biased = resolve_universe(args.universe)
+    if biased:
+        print("WARNING: survivorship-BIASED universe - results are an upper bound. "
+              "Use --universe etf for an honest baseline.\n")
 
     settings = load_settings()
     data = HistoricalData(settings)
@@ -63,7 +72,7 @@ def main() -> None:
     # account can't access SIP history.
     feed_used = "sip"
     bars: dict[str, pd.DataFrame] = {}
-    for sym in args.symbols:
+    for sym in symbols:
         try:
             df = data.get_bars(sym, tf, lookback_days=lookback, use_cache=False, feed=feed_used)
         except APIError as exc:
@@ -73,6 +82,9 @@ def main() -> None:
                 df = data.get_bars(sym, tf, lookback_days=lookback, use_cache=False, feed=feed_used)
             else:
                 raise
+        if windows and sym in windows:  # point-in-time clip
+            lo, hi = windows[sym]
+            df = df[(df.index.date >= lo) & (df.index.date <= hi)]
         if df.empty or len(df) < 150:
             print(f"  skip {sym}: only {len(df)} bars")
             continue

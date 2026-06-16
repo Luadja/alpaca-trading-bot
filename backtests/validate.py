@@ -33,16 +33,11 @@ from backtesting import Backtest
 from backtests.backtest_stoch_rsi_mfi import SrsiMfiBacktest
 from backtests.param_sweep import _bt_df
 from backtests.strategies import REGISTRY
+from backtests.universe import resolve_universe
 from bot.config import load_settings
 from bot.data.historical import HistoricalData, parse_timeframe
 
 warnings.filterwarnings("ignore")
-
-# Diversified: trending tech + indices + defensives/value + range-bound names.
-BASKET = [
-    "AAPL", "MSFT", "NVDA", "SPY", "QQQ", "IWM",
-    "KO", "PG", "JNJ", "XLU", "XLP", "VZ", "INTC", "DIS", "WMT",
-]
 
 REGIMES = [
     ("2018 (Q4 selloff)", "2018-01-01", "2019-01-01"),
@@ -87,6 +82,9 @@ def _run_window(df, signals, start, end, cash, commission):
 
 
 def _aggregate(records: list[dict]) -> dict:
+    if not records:  # e.g. a regime window with no data in the loaded range
+        nan = float("nan")
+        return {"ret": nan, "sharpe": nan, "trades": 0.0, "win": nan, "dd": nan, "beat": nan, "n": 0}
     d = pd.DataFrame(records)
     d["beat"] = d["ret"] > d["bh"]
     return {
@@ -111,12 +109,16 @@ def _row(label: str, m: dict) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Out-of-sample validation")
     ap.add_argument("--strategy", choices=list(REGISTRY), default="stoch_rsi_mfi")
-    ap.add_argument("--symbols", nargs="*", default=BASKET)
+    ap.add_argument("--universe", default="etf",
+                    help="'etf' (survivorship-free, default), 'megacap' (biased), or a CSV path")
+    ap.add_argument("--symbols", nargs="*", default=None, help="explicit symbols (overrides --universe)")
     ap.add_argument("--years-back", type=float, default=8.0)
     ap.add_argument("--is-end", default="2022-01-01", help="in-sample/out-of-sample cutoff")
     ap.add_argument("--timeframe", default="1Day")
     ap.add_argument("--cash", type=float, default=100_000.0)
     ap.add_argument("--commission", type=float, default=0.0005)
+    ap.add_argument("--cost-sweep", action="store_true",
+                    help="after ranking, sweep round-trip cost to find the breakeven where the edge dies")
     ap.add_argument(
         "--min-trades", type=float, default=4.0,
         help="min avg in-sample trades for a param set to be eligible as 'best' "
@@ -130,6 +132,14 @@ def main() -> None:
     entry = REGISTRY[args.strategy]
     compute, build_grid, pkey = entry["signals"], entry["grid"], entry["pkey"]
 
+    if args.symbols:
+        symbols, windows, biased = args.symbols, None, True
+    else:
+        symbols, windows, biased = resolve_universe(args.universe)
+    if biased:
+        print("WARNING: survivorship-BIASED universe (hand-picked survivors) - results are "
+              "an upper bound, not an estimate. Use --universe etf for an honest baseline.\n")
+
     settings = load_settings()
     data = HistoricalData(settings)
     tf = parse_timeframe(args.timeframe)
@@ -137,7 +147,7 @@ def main() -> None:
 
     feed = "sip"
     bars: dict[str, pd.DataFrame] = {}
-    for sym in args.symbols:
+    for sym in symbols:
         try:
             df = data.get_bars(sym, tf, lookback_days=lookback, use_cache=False, feed=feed)
         except APIError as exc:
@@ -147,6 +157,9 @@ def main() -> None:
                 df = data.get_bars(sym, tf, lookback_days=lookback, use_cache=False, feed=feed)
             else:
                 raise
+        if windows and sym in windows:  # point-in-time clip: only bars while investable
+            lo, hi = windows[sym]
+            df = df[(df.index.date >= lo) & (df.index.date <= hi)]
         if not df.empty and len(df) >= 200:
             bars[sym] = df
         else:
@@ -193,10 +206,11 @@ def main() -> None:
     eligible = [(k, m) for k, m in ranked if m["trades"] >= args.min_trades]
     best_key = (eligible or ranked)[0][0]
 
-    def eval_across(param_key: str, start: str, end: str) -> dict:
+    def eval_across(param_key: str, start: str, end: str, commission: float | None = None) -> dict:
+        commission = args.commission if commission is None else commission
         recs = []
         for sym, df in bars.items():
-            stats = _run_window(df, sig_cache[(sym, param_key)], start, end, args.cash, args.commission)
+            stats = _run_window(df, sig_cache[(sym, param_key)], start, end, args.cash, commission)
             if stats is not None:
                 recs.append(_metrics(stats))
         return _aggregate(recs)
@@ -221,6 +235,21 @@ def main() -> None:
     print("-" * len(HEADER))
     for name, start, end in REGIMES:
         print(_row(name, eval_across(best_key, start, end)))
+
+    if args.cost_sweep:
+        print("\n=== COST SENSITIVITY (IS-best, out-of-sample) ===")
+        print(f"{'cost/side bps':>13} {'ret%':>7} {'sharpe':>7} {'beatBH%':>8}")
+        breakeven = None
+        for bps in (0, 5, 10, 20, 35, 50):
+            m = eval_across(best_key, oos_start, oos_end, commission=bps / 10_000.0)
+            print(f"{bps:>13} {m['ret']:>7.1f} {m['sharpe']:>7.2f} {m['beat']:>8.0f}")
+            if breakeven is None and m["ret"] <= 0:
+                breakeven = bps
+        print(
+            f"Edge dies (mean OOS return <= 0) at ~{breakeven} bps/side."
+            if breakeven is not None
+            else "Edge survives through 50 bps/side."
+        )
 
 
 if __name__ == "__main__":

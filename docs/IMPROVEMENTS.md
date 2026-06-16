@@ -36,8 +36,13 @@ any live capital.**
 > alerting (`bot/alerting.py`, Slack/email, log-only when unconfigured), a liveness
 > heartbeat (`bot/heartbeat.py`), and an independent **dead-man's-switch watchdog**
 > (`scripts/watchdog.py`) that flattens on a stale heartbeat — both batches **reviewed
-> adversarially** (high-sev bugs found and fixed each time). Remaining Tier 0: the research
-> gates (survivorship-free universe, realistic costs, go-live gate; §5).
+> adversarially** (high-sev bugs found and fixed each time). ✅ **§5 research gates done**:
+> survivorship-free ETF universe + point-in-time CSV loader (`backtests/universe.py`,
+> default `--universe etf`; mega-cap basket labelled biased), a `--cost-sweep` breakeven
+> readout in the validator, and a mechanical go-live gate (`scripts/go_live_check.py`).
+> **Tier 0 is COMPLETE** — the bot is safe to paper-trade on trustworthy numbers.
+> (Honest finding: on the ETF universe the trend default still validates — OOS Sharpe
+> ~0.44, beats B&H on ~27% of names, edge cost-insensitive through 50 bps/side.)
 
 | # | Gap | Where | Fix | Sev |
 |---|---|---|---|---|

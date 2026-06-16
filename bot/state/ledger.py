@@ -116,6 +116,12 @@ class Ledger:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def status_counts(self) -> dict[str, int]:
+        """Count of orders by status — used by the go-live gate to check paper activity."""
+        with self._lock, closing(self.conn.cursor()) as cur:
+            cur.execute("SELECT status, COUNT(*) AS c FROM orders GROUP BY status")
+            return {r["status"]: r["c"] for r in cur.fetchall()}
+
     def reconcile(self, broker_positions: dict[str, float]) -> dict[str, float]:
         """Broker positions are the truth; callers adopt this and resolve pending_orders()
         against the broker (see TradingBot._reconcile_pending)."""

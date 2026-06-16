@@ -92,7 +92,30 @@ streamlit run dashboard/app.py
 
 # Tests (no keys/network needed — pure indicator/strategy/risk math)
 pytest
+
+# 6. Dead-man's-switch watchdog (run as a SEPARATE process from the bot)
+python -m scripts.watchdog --max-age 180 --interval 30
 ```
+
+## Dashboard & hosting
+
+The dashboard is a Streamlit web app — `streamlit run dashboard/app.py` serves it at
+<http://localhost:8501>. It reads the local SQLite ledger and your `.env` keys, so it must
+run where those live (your machine, or the VPS running the bot).
+
+- **LAN access:** `streamlit run dashboard/app.py --server.address 0.0.0.0 --server.port 8501`,
+  then open `http://<your-LAN-IP>:8501`.
+- **Remote/internet:** run it on the bot's host behind a reverse proxy (Caddy/nginx) with
+  **TLS + authentication** — it displays account equity and positions, so never expose it
+  unauthenticated. (Streamlit Community Cloud can't reach your local ledger/keys.)
+
+## Operational safety (for live/paper deployment)
+
+Run two processes: the bot (`python -m bot.run --interval 300`) and the **watchdog**
+(`python -m scripts.watchdog`) as independent services so the watchdog can flatten if the
+bot dies. Configure alerts (Slack/email) in `.env` so kill-switch trips, rejects, and
+heartbeat loss page you. See [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) for the full
+hardening roadmap.
 
 ## Risk controls (built in)
 

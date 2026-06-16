@@ -27,6 +27,7 @@ def test_fill_pending_and_state(tmp_path):
     led.record_fill("c1", 10, 150.0, "filled")
     assert led.pending_orders() == []  # filled is terminal
     assert led.already_submitted("c1")
+    assert led.status_counts().get("filled") == 1
 
     # Persistent KV state (used for kill-switch/equity anchors).
     assert led.get_state("risk") is None
