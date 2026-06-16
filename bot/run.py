@@ -131,11 +131,12 @@ class TradingBot:
         # Catastrophic stop: flatten any managed position past the hard stop, before signals.
         stopped = self._enforce_stops(positions_raw, positions)
 
-        # Use broker-reported market values; tally exposure as we place orders so the
-        # exposure gate actually bounds TOTAL exposure across same-cycle entries.
-        running_exposure = sum(
-            abs(float(p.market_value)) for p in positions_raw if p.symbol not in stopped
-        )
+        # Per-symbol market value; tally exposure as we place orders so the exposure gate
+        # bounds TOTAL exposure across same-cycle entries (exit frees the seeded value).
+        position_mv = {
+            p.symbol: abs(float(p.market_value)) for p in positions_raw if p.symbol not in stopped
+        }
+        running_exposure = sum(position_mv.values())
 
         # Market-regime gate (Faber): only allow NEW longs when the broad market is up.
         regime_ok = self._market_regime_ok()
@@ -148,7 +149,7 @@ class TradingBot:
                 continue  # just flattened on the stop — don't re-act this cycle
             try:
                 running_exposure = self._evaluate_symbol(
-                    symbol, account.equity, positions, running_exposure, regime_ok
+                    symbol, account.equity, positions, running_exposure, regime_ok, position_mv
                 )
             except Exception as exc:  # one bad symbol shouldn't take down the loop
                 self.log.exception("error evaluating %s", symbol)
@@ -177,7 +178,8 @@ class TradingBot:
                 positions[p.symbol] = 0.0
         return stopped
 
-    def _evaluate_symbol(self, symbol, equity, positions, running_exposure, regime_ok=True) -> float:
+    def _evaluate_symbol(self, symbol, equity, positions, running_exposure, regime_ok=True,
+                         position_mv=None) -> float:
         # ~550 daily bars: enough that the 200-SMA is valid well before recent crosses
         # (a short window can miss the last golden/death cross). Reduce for sub-daily.
         df = self.data.get_bars(symbol, self.timeframe, lookback_days=800, use_cache=False)
@@ -208,14 +210,17 @@ class TradingBot:
 
         elif decision.signal is SignalType.EXIT_LONG and held > 0:
             self._exit(symbol, held, decision, bar_ts)
-            running_exposure -= held * decision.price
+            # Free the value we SEEDED for this symbol (market_value basis), not a bar-close
+            # estimate, so the tally returns to its true post-exit level.
+            running_exposure -= (position_mv or {}).get(symbol, held * decision.price)
 
         return running_exposure
 
     def _enter(self, symbol, qty, decision: SignalDecision, bar_ts) -> float:
-        """Submit a buy, verify the fill, and return the FILLED notional added to exposure.
-        The gate re-check + submit are atomic under the lock so a concurrent kill-switch
-        flatten can't interleave; the (potentially slow) fill poll runs outside the lock."""
+        """Submit a buy, verify the fill, and return the COMMITTED notional for the exposure
+        gate (qty*price — counts even if a marketable limit rests unfilled, so same-cycle
+        entries can't over-allocate). The gate re-check + submit are atomic under the lock so
+        a concurrent kill-switch flatten can't interleave; the fill poll runs outside it."""
         coid = self._coid(symbol, "buy", bar_ts)
         with self._lock:
             if self.risk.halted:
@@ -234,7 +239,7 @@ class TradingBot:
             self.ledger.mark_submitted(coid, str(order.id))
         filled = self._await_fill(coid)
         self.log.info("%s: BUY %s/%s filled (coid=%s)", symbol, filled, qty, coid)
-        return filled * decision.price
+        return qty * decision.price  # committed notional (conservative for the gate)
 
     def _exit(self, symbol, held, decision: SignalDecision, bar_ts) -> None:
         """Exit via a deterministic-coid SELL (not close_position) so it dedupes and
@@ -380,6 +385,9 @@ class TradingBot:
             if not self.broker.is_market_open():
                 return
             equity = self.broker.account().equity  # network read, outside the lock
+            # Roll day/week/month anchors first — safety_poll usually fires before step() on a
+            # new session, so without this it would measure loss vs the PRIOR period's baseline.
+            self._maybe_roll_day(equity)
             with self._lock:
                 halted = self.risk.update(equity)
                 self._persist_risk()

@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import math
+import re
 import warnings
 
 import numpy as np
@@ -57,6 +58,15 @@ HEADER = (
 
 def _ts(s: str) -> pd.Timestamp:
     return pd.Timestamp(s, tz="UTC")
+
+
+def _periods_per_year(timeframe: str) -> float:
+    """Bars/year for the timeframe, to de-annualize Sharpe for the Deflated Sharpe math."""
+    m = re.fullmatch(r"(\d+)\s*(min|hour|day|week|month)s?", timeframe.strip().lower())
+    if not m:
+        return 252.0
+    per = {"min": 252 * 390, "hour": 252 * 6.5, "day": 252, "week": 52, "month": 12}[m.group(2)]
+    return per / int(m.group(1))
 
 
 def _finite(value) -> float:
@@ -115,11 +125,14 @@ def _aggregate(records: list[dict]) -> dict:
 
 
 def _row(label: str, m: dict) -> str:
-    win = f"{m['win']:.0f}" if not np.isnan(m["win"]) else "-"
+    def f(key: str, spec: str) -> str:
+        v = m[key]
+        return "-" if (v is None or (isinstance(v, float) and np.isnan(v))) else format(v, spec)
+
     return (
-        f"{label:<34} {m['ret']:>7.1f} {m['sharpe']:>7.2f} {m['sortino']:>7.2f} "
-        f"{m['calmar']:>7.2f} {m['trades']:>7.1f} {win:>6} {m['dd']:>7.1f} "
-        f"{m['beat']:>8.0f} {m['n']:>3}"
+        f"{label:<34} {f('ret', '>7.1f')} {f('sharpe', '>7.2f')} {f('sortino', '>7.2f')} "
+        f"{f('calmar', '>7.2f')} {f('trades', '>7.1f')} {f('win', '>6.0f')} {f('dd', '>7.1f')} "
+        f"{f('beat', '>8.0f')} {m['n']:>3}"
     )
 
 
@@ -182,7 +195,7 @@ def main() -> None:
         else:
             print(f"  skip {sym}: {len(df)} bars")
 
-    is_start = str(df.index.min().date())  # earliest available
+    is_start = str(min(d.index.min() for d in bars.values()).date())  # basket-wide earliest
     is_end = args.is_end
     oos_start, oos_end = args.is_end, "2027-01-01"
     print(f"Loaded {len(bars)} symbols via {feed} feed.")
@@ -239,14 +252,18 @@ def main() -> None:
         print(_row(key, m))
 
     # Deflated Sharpe: did the best config beat what selecting over N trials yields by luck?
-    trial_sharpes = [m["sharpe"] for m in is_agg.values()]
+    # backtesting.py reports ANNUALIZED Sharpe; the DSR math needs PER-PERIOD Sharpe with
+    # n_obs = number of bars, so de-annualize first (else the guard saturates at 1.0).
+    ann = _periods_per_year(args.timeframe) ** 0.5
+    trial_sharpes = [m["sharpe"] / ann for m in is_agg.values()]
+    observed = is_agg[best_key]["sharpe"] / ann
     sample_df = next(iter(bars.values()))
     n_obs = int(((sample_df.index >= _ts(is_start)) & (sample_df.index < _ts(is_end))).sum())
     sr0 = expected_max_sharpe(trial_sharpes)
-    dsr = deflated_sharpe(is_agg[best_key]["sharpe"], trial_sharpes, n_obs)
+    dsr = deflated_sharpe(observed, trial_sharpes, n_obs)
     print(f"\nIS-best chosen: {best_key}")
-    print(f"Deflated Sharpe: {dsr:.2f} (bless if >=0.95) | luck benchmark SR0={sr0:.2f} "
-          f"vs observed {is_agg[best_key]['sharpe']:.2f} over {len(trial_sharpes)} trials\n")
+    print(f"Deflated Sharpe: {dsr:.2f} (bless if >=0.95) | per-period luck benchmark SR0={sr0:.3f} "
+          f"vs observed {observed:.3f} over {len(trial_sharpes)} trials\n")
 
     print("=== OVERFITTING CHECK: IS-best & default, in-sample vs out-of-sample ===")
     print(HEADER)

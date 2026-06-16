@@ -12,7 +12,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # Columns drawn as price overlays vs. in the lower oscillator panel.
-_OVERLAYS = [("sma_fast", "SMA fast"), ("sma_slow", "SMA slow"), ("sma_trend", "trend SMA")]
+_OVERLAYS = [
+    ("sma_fast", "SMA fast"),
+    ("sma_slow", "SMA slow"),
+    ("sma_trend", "trend SMA"),
+    ("sma_regime", "regime SMA"),
+]
 _OSCILLATORS = [("stochrsi_k", "StochRSI %K"), ("stochrsi_d", "StochRSI %D"), ("mfi", "MFI")]
 
 
