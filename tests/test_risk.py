@@ -47,3 +47,12 @@ def test_entry_approved_when_within_limits():
     decision = rm.evaluate_entry(equity=100_000, price=100, current_exposure_value=0)
     assert decision.approved
     assert decision.qty > 0
+
+
+def test_catastrophic_stop_triggers_below_threshold():
+    rm = RiskManager(RiskConfig(catastrophic_stop_pct=0.10), 100_000)
+    assert rm.should_stop_out(entry_price=100, current_price=89)  # -11% -> stop
+    assert rm.should_stop_out(entry_price=100, current_price=90)  # exactly -10% -> stop
+    assert not rm.should_stop_out(entry_price=100, current_price=95)  # -5% -> hold
+    assert not rm.should_stop_out(entry_price=100, current_price=120)  # winner
+    assert not rm.should_stop_out(entry_price=0, current_price=50)  # no entry price -> no stop

@@ -26,6 +26,10 @@ market" is how you overfit and trade away the one durable edge (drawdown control
 These are not enhancements; they are latent defects the review found. **Do these before
 any live capital.**
 
+> **Status (2026-06-16):** ✅ **1.1** (catastrophic stop now enforced in `run.py._enforce_stops`
+> using the broker's entry/current prices) and ✅ **1.5** (retry/backoff + idempotent submit in
+> `broker.py`) are done; the §4 **market-clock gate** is also in. Remaining: 1.2, 1.3, 1.4, 1.6.
+
 | # | Gap | Where | Fix | Sev |
 |---|---|---|---|---|
 | 1.1 | **The stop-loss is fictional.** `stop_loss_pct`/`default_stop()` are used *only* to size the entry; the live loop never compares price to a stop. A losing trade has no downside bound until the next death cross (~1–3/yr) — this is the source of the ~−26% single-symbol drawdown. | [risk/manager.py](../bot/risk/manager.py), [run.py](../bot/run.py) | Add `should_stop_out(entry, price, pct)` (pure, testable); persist entry fill price in the ledger; in `run.py._evaluate_symbol`, for every held symbol exit via `close_position` if breached. Make it a **hard catastrophic stop (8–10%, wider than signal noise)** — disaster insurance, *not* the alpha trailing stop that was correctly reverted. Optionally place a native Alpaca stop/bracket order so it survives downtime. | **High** |

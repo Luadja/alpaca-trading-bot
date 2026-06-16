@@ -19,8 +19,9 @@ from dataclasses import dataclass
 class RiskConfig:
     max_position_pct: float = 0.10  # max % of equity in any single position
     max_total_exposure_pct: float = 0.60  # max % of equity invested across all positions
-    risk_per_trade_pct: float = 0.01  # % of equity risked between entry and stop
-    stop_loss_pct: float = 0.05  # default stop distance below entry
+    risk_per_trade_pct: float = 0.01  # % of equity risked between entry and stop (sizing)
+    stop_loss_pct: float = 0.05  # stop distance used for risk-per-trade SIZING only
+    catastrophic_stop_pct: float = 0.10  # HARD enforced exit: flatten if price falls this far
     max_daily_loss_pct: float = 0.03  # kill-switch threshold (loss vs. day-start equity)
     allow_fractional: bool = False  # whole shares avoid fractional-order constraints
 
@@ -86,6 +87,13 @@ class RiskManager:
 
     def default_stop(self, entry_price: float) -> float:
         return entry_price * (1.0 - self.config.stop_loss_pct)
+
+    def should_stop_out(self, entry_price: float, current_price: float) -> bool:
+        """Hard catastrophic stop (disaster insurance, distinct from the sizing stop and
+        the strategy's own exit): True once price falls catastrophic_stop_pct below entry."""
+        if entry_price <= 0:
+            return False
+        return current_price <= entry_price * (1.0 - self.config.catastrophic_stop_pct)
 
     def evaluate_entry(
         self,

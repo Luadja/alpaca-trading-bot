@@ -1,16 +1,21 @@
 """Thin wrapper around alpaca-py's TradingClient.
 
-Key safety property: every order carries a unique ``client_order_id`` so a retry
-after a network timeout cannot create a duplicate. Alpaca does NOT guarantee it
-rejects duplicate orders, so the bot must own idempotency. On a timeout, VERIFY
-via the API — never blindly resend.
+Two safety properties:
+  * Every order carries a deterministic ``client_order_id`` so a retry after a
+    network timeout cannot create a duplicate — Alpaca rejects a duplicate id, and
+    we treat that rejection as "already landed" and fetch the existing order.
+  * All calls go through ``_retry`` (exponential backoff + jitter) so a single 429
+    (200 req/min limit) or transient network error doesn't abort the trading cycle.
 """
 
 from __future__ import annotations
 
+import random
+import time
 import uuid
 from dataclasses import dataclass
 
+from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
@@ -20,6 +25,34 @@ from alpaca.trading.requests import (
 )
 
 from bot.config import Settings
+
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _retry(fn, *, tries: int = 5, base: float = 1.0):
+    """Call fn() with capped exponential backoff + jitter on transient errors.
+
+    Safe only for idempotent operations: reads, or writes keyed by a deterministic
+    client_order_id (which Alpaca dedupes). 429s and 5xx/network blips are retried;
+    other API errors propagate immediately.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(tries):
+        try:
+            return fn()
+        except APIError as exc:
+            if getattr(exc, "status_code", None) not in _RETRYABLE_STATUS:
+                raise
+            last_exc = exc
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            last_exc = exc
+        time.sleep(min(30.0, base * (2 ** attempt) + random.uniform(0.0, 0.5)))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _is_duplicate_coid(exc: APIError) -> bool:
+    return getattr(exc, "status_code", None) == 422 and "client_order_id" in str(exc).lower()
 
 
 @dataclass
@@ -35,9 +68,9 @@ class Broker:
         self.client = TradingClient(settings.api_key, settings.api_secret, paper=settings.paper)
         self.paper = settings.paper
 
-    # --- reads -------------------------------------------------------------
+    # --- reads (freely retryable) ------------------------------------------
     def account(self) -> AccountSnapshot:
-        acct = self.client.get_account()
+        acct = _retry(self.client.get_account)
         return AccountSnapshot(
             equity=float(acct.equity),
             cash=float(acct.cash),
@@ -45,8 +78,8 @@ class Broker:
         )
 
     def list_positions(self):
-        """Raw position objects (have .symbol, .qty, .market_value)."""
-        return self.client.get_all_positions()
+        """Raw position objects (have .symbol, .qty, .market_value, .avg_entry_price, .current_price)."""
+        return _retry(self.client.get_all_positions)
 
     def positions(self) -> dict[str, float]:
         """symbol -> signed quantity for all open positions."""
@@ -56,12 +89,34 @@ class Broker:
         return self.positions().get(symbol, 0.0)
 
     def open_orders(self):
-        return self.client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+        return _retry(
+            lambda: self.client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+        )
+
+    def market_clock(self):
+        return _retry(self.client.get_clock)
+
+    def is_market_open(self) -> bool:
+        return bool(self.market_clock().is_open)
 
     # --- writes ------------------------------------------------------------
     @staticmethod
     def new_client_order_id(prefix: str = "bot") -> str:
         return f"{prefix}-{uuid.uuid4().hex[:20]}"
+
+    def _submit(self, req, coid: str):
+        """Submit an order, retrying transient errors. The deterministic coid makes a
+        retried submit safe: a duplicate-id rejection means a prior attempt landed, so
+        fetch and return that order instead of resubmitting."""
+        def do():
+            try:
+                return self.client.submit_order(order_data=req)
+            except APIError as exc:
+                if _is_duplicate_coid(exc):
+                    return self.client.get_order_by_client_id(coid)
+                raise
+
+        return _retry(do)
 
     def submit_market(
         self,
@@ -70,14 +125,11 @@ class Broker:
         side: OrderSide,
         client_order_id: str | None = None,
     ):
+        coid = client_order_id or self.new_client_order_id()
         req = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=side,
-            time_in_force=TimeInForce.DAY,
-            client_order_id=client_order_id or self.new_client_order_id(),
+            symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY, client_order_id=coid
         )
-        return self.client.submit_order(order_data=req)
+        return self._submit(req, coid)
 
     def submit_limit(
         self,
@@ -87,15 +139,16 @@ class Broker:
         limit_price: float,
         client_order_id: str | None = None,
     ):
+        coid = client_order_id or self.new_client_order_id()
         req = LimitOrderRequest(
             symbol=symbol,
             qty=qty,
             side=side,
             limit_price=round(limit_price, 2),
             time_in_force=TimeInForce.DAY,
-            client_order_id=client_order_id or self.new_client_order_id(),
+            client_order_id=coid,
         )
-        return self.client.submit_order(order_data=req)
+        return self._submit(req, coid)
 
     def buy(self, symbol: str, qty: float, client_order_id: str | None = None):
         return self.submit_market(symbol, qty, OrderSide.BUY, client_order_id)
@@ -104,10 +157,19 @@ class Broker:
         return self.submit_market(symbol, qty, OrderSide.SELL, client_order_id)
 
     def close_position(self, symbol: str):
-        """Liquidate the full position in one symbol (handles fractional qty)."""
-        return self.client.close_position(symbol)
+        """Liquidate the full position in one symbol (handles fractional qty).
+        Tolerates a 404 (already flat) so it's safe to call defensively."""
+        def do():
+            try:
+                return self.client.close_position(symbol)
+            except APIError as exc:
+                if getattr(exc, "status_code", None) == 404:
+                    return None  # no position to close
+                raise
+
+        return _retry(do)
 
     # --- kill switch -------------------------------------------------------
     def flatten_all(self) -> None:
         """Cancel open orders and close every position. Used by the kill switch."""
-        self.client.close_all_positions(cancel_orders=True)
+        _retry(lambda: self.client.close_all_positions(cancel_orders=True))

@@ -62,6 +62,11 @@ class TradingBot:
         )
 
     def step(self) -> None:
+        # Don't poll/submit into a closed market (TIF=DAY would silently drop orders).
+        if not self.broker.is_market_open():
+            self.log.info("Market closed — skipping cycle.")
+            return
+
         account = self.broker.account()
         self._maybe_roll_day(account.equity)
 
@@ -78,17 +83,43 @@ class TradingBot:
             self.broker.flatten_all()
             return
 
+        # Catastrophic stop: flatten any managed position past the hard stop, before signals.
+        stopped = self._enforce_stops(positions_raw, positions)
+
         # Use broker-reported market values; tally exposure as we place orders so the
         # exposure gate actually bounds TOTAL exposure across same-cycle entries.
-        running_exposure = sum(abs(float(p.market_value)) for p in positions_raw)
+        running_exposure = sum(
+            abs(float(p.market_value)) for p in positions_raw if p.symbol not in stopped
+        )
 
         for symbol in self.settings.symbols:
+            if symbol in stopped:
+                continue  # just flattened on the stop — don't re-act this cycle
             try:
                 running_exposure = self._evaluate_symbol(
                     symbol, account.equity, positions, running_exposure
                 )
             except Exception:  # one bad symbol shouldn't take down the loop
                 self.log.exception("error evaluating %s", symbol)
+
+    def _enforce_stops(self, positions_raw, positions: dict) -> set:
+        """Hard catastrophic stop on managed positions, using the broker's own entry and
+        current prices. Returns the set of symbols flattened this cycle."""
+        stopped: set = set()
+        managed = set(self.settings.symbols)
+        for p in positions_raw:
+            if p.symbol not in managed or float(p.qty) <= 0:
+                continue
+            entry, price = float(p.avg_entry_price), float(p.current_price)
+            if self.risk.should_stop_out(entry, price):
+                self.log.warning(
+                    "%s: CATASTROPHIC STOP (entry %.2f, price %.2f, %.1f%%) — flattening",
+                    p.symbol, entry, price, (price / entry - 1) * 100 if entry else 0.0,
+                )
+                self.broker.close_position(p.symbol)
+                stopped.add(p.symbol)
+                positions[p.symbol] = 0.0
+        return stopped
 
     def _evaluate_symbol(self, symbol, equity, positions, running_exposure) -> float:
         # ~550 daily bars: enough that the 200-SMA is valid well before recent crosses
