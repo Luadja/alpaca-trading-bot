@@ -243,6 +243,16 @@ thin statistical power; max DD ~−26% (the 200-SMA lags, so gains are given bac
 death-cross exit). Net: a defensible, drawdown-aware strategy with stable OOS behaviour — the
 first config in this study with a plausible edge.
 
+**Exit experiment (trailing stop) — tried, reverted.** To attack the ~−26% max DD, added a
+percent trailing stop (exit if close falls X% below the peak since entry). Across the grid it
+cut DD only modestly (−26%→−22% at 15%) while **gutting returns and beat-B&H** (OOS +101.7%
+→ +34.5%, beats B&H 33%→20%) — a tight exit stops out on normal pullbacks and can't re-enter
+without a new golden cross, forfeiting the trend continuation. Even a loose 20% trail
+underperformed no-stop. **Kept as an option but OFF by default.** Note: the −26% is a
+per-symbol, full-equity backtest figure — live, the risk layer (10% max position, 60% max
+exposure, daily kill switch) caps *portfolio* drawdown well below the single-name number, so
+DD control belongs at position-sizing, not a tighter exit.
+
 Tooling note: the validator's `--min-trades` filter (built for the oscillator) wrongly
 excludes low-frequency trend configs — use `--min-trades 0-1` for trend strategies. The
 backtest tooling is now strategy-agnostic via `backtests/strategies.py` (`--strategy`).
@@ -256,10 +266,12 @@ validated well: the 50/200 golden cross is robust OOS, protects in bears, and be
 third of the basket. Open decisions:
 
 1. **Make trend-following the bot's live default?** `run.py` still wires `StochRsiMfiStrategy`;
-   the validated choice is `TrendMomentumStrategy` (50/200). Optionally make the strategy
-   config-selectable (mirrors the backtest registry).
-2. **Strengthen the trend strategy** — add a trailing-stop / faster exit to cut the ~−26% max
-   DD (the 200-SMA lags on the way down), and validate on more symbols to thicken the sample.
+   the validated choice is `TrendMomentumStrategy` (50/200, no trailing stop). Optionally make
+   the strategy config-selectable (mirrors the backtest registry).
+2. ~~Trailing-stop exit~~ → tried and **reverted** (cut returns/edge more than DD; §10). DD
+   control belongs at the portfolio level (position sizing / max exposure), already in the risk
+   layer. Remaining strengthening: validate on more symbols to thicken the sample, or a
+   market-regime (SPY) gate.
 3. **Paper run (Phase 8)** with the chosen strategy.
 
 ---

@@ -48,21 +48,24 @@ def _stoch_pkey(p: StochRsiMfiParams) -> str:
 
 # --- trend_momentum ----------------------------------------------------------
 def _trend_grid() -> list[TrendMomentumParams]:
-    """Fast/slow SMA pairs x regime filter on/off. 2x2x2 = 8 sets."""
+    """The two strong SMA pairs x trailing-stop {off, 10%, 15%, 20%}. 3x4 = 12 sets."""
     grid = []
-    for fast in (20, 50):
-        for slow in (100, 200):
-            for regime in (False, True):
-                grid.append(
-                    TrendMomentumParams(
-                        fast_sma=fast, slow_sma=slow, use_regime_filter=regime, regime_sma=200
-                    )
+    for fast, slow in ((20, 100), (50, 100), (50, 200)):
+        for trail in (0.0, 0.10, 0.15, 0.20):
+            grid.append(
+                TrendMomentumParams(
+                    fast_sma=fast,
+                    slow_sma=slow,
+                    use_trailing_stop=trail > 0,
+                    trail_pct=trail if trail > 0 else 0.15,
                 )
+            )
     return grid
 
 
 def _trend_pkey(p: TrendMomentumParams) -> str:
-    return f"sma{int(p.fast_sma)}/{int(p.slow_sma)} reg={'Y' if p.use_regime_filter else 'N'}"
+    trail = f"trail{int(p.trail_pct * 100)}" if p.use_trailing_stop else "trail-off"
+    return f"sma{int(p.fast_sma)}/{int(p.slow_sma)} {trail}"
 
 
 REGISTRY = {

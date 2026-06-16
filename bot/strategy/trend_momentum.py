@@ -6,9 +6,16 @@ Where mean-reversion fights the trend, this rides it: go long on a dual-SMA
 return anomalies and has a far better prior than mean-reversion on a trending
 mega-cap / ETF universe.
 
-Optional filters:
+Optional filters / exits:
   * regime: require price above a long SMA (extra trend confirmation),
-  * momentum: require trailing N-bar ROC above a threshold.
+  * momentum: require trailing N-bar ROC above a threshold,
+  * trailing stop: exit when close falls trail_pct below the peak since entry — caps the
+    give-back the lagging slow-SMA would otherwise allow before a death-cross exit.
+
+The trailing stop makes signal generation path-dependent (a stateful pass), so it assumes
+entries fill as simulated. For LIVE trading the trailing stop should ultimately be enforced
+against the ACTUAL broker position/entry in the execution layer; the strategy-level version
+here is the backtest/validation model.
 
 Same pure contract as the other strategies: data in, signals out, no broker calls.
 `compute_signals` is shared by the live path and the backtest/validation harness.
@@ -18,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from bot.models import SignalDecision, SignalType
@@ -32,6 +40,11 @@ class TrendMomentumParams:
     regime_sma: int = 200
     roc_length: int = 0  # 0 = off; else require ROC(roc_length) > roc_min to enter
     roc_min: float = 0.0
+    # Trailing stop is OFF by default: validation showed it cuts drawdown only modestly
+    # while gutting returns/edge (stops out on normal pullbacks, can't re-enter without a
+    # new golden cross). Available as an option. See docs/PLAN.md §10.
+    use_trailing_stop: bool = False
+    trail_pct: float = 0.15  # exit if close falls this fraction below the peak since entry
 
     @property
     def min_bars(self) -> int:
@@ -63,11 +76,30 @@ def compute_signals(df: pd.DataFrame, params: TrendMomentumParams | None = None)
         out["roc"] = out["close"].pct_change(p.roc_length, fill_method=None) * 100.0
         enter = enter & (out["roc"] > p.roc_min)
 
-    out["signal"] = 0
-    out.loc[enter.fillna(False), "signal"] = 1
-    out.loc[cross_down.fillna(False), "signal"] = -1
+    # Stateful pass: while in a position, ride until the death cross OR a trailing stop
+    # (close falls trail_pct below the peak close since entry).
+    closes = out["close"].to_numpy(dtype=float)
+    enter_arr = enter.fillna(False).to_numpy()
+    exit_arr = cross_down.fillna(False).to_numpy()
+    sig = np.zeros(len(out), dtype=int)
+    in_pos = False
+    peak = 0.0
+    for i in range(len(out)):
+        if not in_pos:
+            if enter_arr[i]:
+                sig[i] = 1
+                in_pos = True
+                peak = closes[i]
+        else:
+            peak = max(peak, closes[i])
+            stop_hit = p.use_trailing_stop and closes[i] <= peak * (1.0 - p.trail_pct)
+            if exit_arr[i] or stop_hit:
+                sig[i] = -1
+                in_pos = False
+
+    out["signal"] = sig
     out["confidence"] = 0.0
-    out.loc[enter.fillna(False), "confidence"] = 1.0
+    out.loc[out["signal"] == 1, "confidence"] = 1.0
     return out
 
 
