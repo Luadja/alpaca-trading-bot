@@ -24,10 +24,13 @@ warnings.filterwarnings("ignore")
 
 OOS_START = "2022-01-01"
 
+BUILDERS = {"xsec": pf.weights_xsec_momentum, "dual": pf.weights_dual_momentum}
+_BUILDER = pf.weights_xsec_momentum  # set in main() from --strategy
+
 
 def _net(panel, cfg, cost):
-    w = pf.weights_xsec_momentum(panel, lookback=cfg["lookback"], skip=21,
-                                 top_n=cfg["top_n"], rebalance_days=cfg["rebalance"])
+    w = _BUILDER(panel, lookback=cfg["lookback"], skip=21,
+                 top_n=cfg["top_n"], rebalance_days=cfg["rebalance"])
     return pf.backtest(w, panel, cost).net_returns
 
 
@@ -40,18 +43,22 @@ def _sharpe(m):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Deep cross-sectional momentum validation")
+    ap = argparse.ArgumentParser(description="Deep momentum validation (cross-sectional or dual)")
     ap.add_argument("--universe", default="multiasset")
+    ap.add_argument("--strategy", choices=list(BUILDERS), default="xsec")
     ap.add_argument("--years-back", type=float, default=8.0)
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--embargo-days", type=int, default=21)
     ap.add_argument("--cost", type=float, default=0.0005)
     args = ap.parse_args()
 
+    global _BUILDER
+    _BUILDER = BUILDERS[args.strategy]
+
     symbols, _, _ = resolve_universe(args.universe)
     bars, feed = load_bars(symbols, args.years_back, "1Day")
     panel = pf.build_panel(bars)
-    print(f"{len(bars)} symbols via {feed}; panel {panel.index[0].date()} -> "
+    print(f"STRATEGY={args.strategy} | {len(bars)} symbols via {feed}; panel {panel.index[0].date()} -> "
           f"{panel.index[-1].date()} ({len(panel)} days); cost {args.cost*1e4:.0f}bps/side\n")
 
     bench_net = pf.backtest(pf.weights_equal_buy_hold(panel), panel, args.cost).net_returns

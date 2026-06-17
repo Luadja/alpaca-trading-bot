@@ -66,6 +66,7 @@ def main() -> None:
         "TREND 50/200 (the bot)": pf.weights_trend_equal(panel, 50, 200),
         "BUY & HOLD (equal-wt)": pf.weights_equal_buy_hold(panel),
         "X-SECTIONAL MOM (L252,top4)": pf.weights_xsec_momentum(panel, lookback=252, top_n=4, rebalance_days=21),
+        "DUAL MOMENTUM (L252,top4)": pf.weights_dual_momentum(panel, lookback=252, top_n=4, rebalance_days=21),
     }
     nets = {name: pf.backtest(w, panel, args.cost).net_returns for name, w in strategies.items()}
     monthlies = {name: _monthly(net) for name, net in nets.items()}

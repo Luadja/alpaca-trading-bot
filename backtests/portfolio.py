@@ -82,6 +82,27 @@ def weights_xsec_momentum(
     return w.ffill().fillna(0.0)
 
 
+def weights_dual_momentum(
+    panel: pd.DataFrame, lookback: int = 252, skip: int = 21, top_n: int = 4, rebalance_days: int = 21
+) -> pd.DataFrame:
+    """Dual momentum (#3 + crash filter): RELATIVE momentum picks the top_n strongest
+    (cross-sectional), then ABSOLUTE momentum gates each one — a pick is held only while its
+    OWN trailing return is positive, otherwise that 1/top_n slot goes to cash. In a broad
+    downturn even the strongest names turn negative, so the book rotates to cash (the crash
+    protection plain cross-sectional lacks — it stays fully invested in the 'least-bad' assets).
+    Causal: momentum uses only past closes."""
+    mom = panel.shift(skip) / panel.shift(lookback) - 1.0
+    w = pd.DataFrame(np.nan, index=panel.index, columns=panel.columns)
+    for d in panel.index[::rebalance_days]:
+        row = mom.loc[d].dropna()
+        w.loc[d] = 0.0
+        if len(row):
+            held = row.nlargest(min(top_n, len(row)))
+            held = held[held > 0.0]  # absolute filter: only positive-momentum picks; rest -> cash
+            w.loc[d, held.index] = 1.0 / top_n  # fixed 1/top_n slots; filtered slots stay cash
+    return w.ffill().fillna(0.0)
+
+
 def weights_equal_buy_hold(panel: pd.DataFrame) -> pd.DataFrame:
     """Benchmark: hold every symbol at 1/N, rebalanced daily (the 'just own the universe' line)."""
     n = panel.shape[1]

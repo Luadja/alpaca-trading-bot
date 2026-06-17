@@ -72,6 +72,19 @@ def test_xsec_holds_top_n():
     assert set(last[last > 0].index) == {"C", "D"}  # the two strongest
 
 
+def test_dual_momentum_cash_filter():
+    idx = _idx(80)
+    t = np.arange(80)
+    # rising: every asset has positive momentum -> top_n all pass the absolute filter -> gross 1
+    up = pd.DataFrame({c: 100 * 1.001 ** (t * (i + 1)) for i, c in enumerate("ABCD")}, index=idx)
+    w_up = pf.weights_dual_momentum(up, lookback=20, skip=2, top_n=2, rebalance_days=5)
+    assert abs(w_up.iloc[-1].sum() - 1.0) < 1e-9
+    # falling: every asset has negative momentum -> all filtered out -> 100% cash (crash defense)
+    down = pd.DataFrame({c: 100 * 0.999 ** (t * (i + 1)) for i, c in enumerate("ABCD")}, index=idx)
+    w_dn = pf.weights_dual_momentum(down, lookback=20, skip=2, top_n=2, rebalance_days=5)
+    assert w_dn.iloc[-1].sum() == 0.0
+
+
 def test_build_panel_inner_join():
     a = pd.DataFrame({"close": [1, 2, 3]}, index=_idx(3))
     b = pd.DataFrame({"close": [10, 20]}, index=_idx(2, "2020-01-02"))  # offset by a day
