@@ -26,10 +26,12 @@ class Settings(BaseSettings):
     # full market). "sip" requires the paid Algo Trader Plus plan.
     feed: str = Field(default="iex", validation_alias="ALPACA_FEED")
 
-    # Diversified, survivorship-free default (broad + sector ETFs) — breadth is what turns
-    # the thin per-symbol trend edge into a respectable portfolio.
+    # Cross-asset, survivorship-free default: 6 low-correlation classes (US/intl equity,
+    # Treasuries, credit, gold, commodities, REITs). Portfolio research (2026-06-17) showed
+    # real diversification — not more equity sectors — is what lowers drawdown and lets the
+    # trend overlay add value; an all-equity set is ~0.8-0.95 correlated. See backtests/portfolio.py.
     symbols: list[str] = Field(
-        default=["SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLP", "XLU", "XLY", "IWM"],
+        default=["SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "IEF", "LQD", "HYG", "GLD", "DBC", "VNQ"],
         validation_alias="BOT_SYMBOLS",
     )
     timeframe: str = Field(default="1Day", validation_alias="BOT_TIMEFRAME")
