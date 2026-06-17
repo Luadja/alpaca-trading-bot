@@ -92,19 +92,6 @@ class Broker:
     def position_qty(self, symbol: str) -> float:
         return self.positions().get(symbol, 0.0)
 
-    def get_position(self, symbol: str):
-        """Raw position object for one symbol (has avg_entry_price, unrealized_pl/plpc,
-        current_price), or None if flat (404). Used to report realized P&L on an exit."""
-        def do():
-            try:
-                return self.client.get_open_position(symbol)
-            except APIError as exc:
-                if getattr(exc, "status_code", None) == 404:
-                    return None
-                raise
-
-        return _retry(do)
-
     def open_orders(self):
         return _retry(
             lambda: self.client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))

@@ -180,6 +180,9 @@ class TradingBot:
             for p in positions_raw if p.symbol not in flat
         }
         running_exposure = sum(position_mv.values())
+        # Reuse this cycle's positions read for the exit-activity P&L snapshot — so _exit needn't
+        # make a fresh (retrying) network call that could delay a real liquidation.
+        pos_by_symbol = {p.symbol: p for p in positions_raw}
 
         # Market-regime gate (Faber): only allow NEW longs when the broad market is up.
         regime_ok = self._market_regime_ok()
@@ -193,7 +196,7 @@ class TradingBot:
             try:
                 running_exposure = self._evaluate_symbol(
                     symbol, account.equity, positions, running_exposure, regime_ok,
-                    position_mv, account.buying_power,
+                    position_mv, account.buying_power, pos_by_symbol,
                 )
             except Exception as exc:  # one bad symbol shouldn't take down the loop
                 self.log.exception("error evaluating %s", symbol)
@@ -294,7 +297,7 @@ class TradingBot:
         return self._await_fill(coid)
 
     def _evaluate_symbol(self, symbol, equity, positions, running_exposure, regime_ok=True,
-                         position_mv=None, buying_power=None) -> float:
+                         position_mv=None, buying_power=None, pos_by_symbol=None) -> float:
         # ~550 daily bars: enough that the 200-SMA is valid well before recent crosses
         # (a short window can miss the last golden/death cross). Reduce for sub-daily.
         df = self.data.get_bars(symbol, self.timeframe, lookback_days=800, use_cache=False)
@@ -345,7 +348,7 @@ class TradingBot:
             running_exposure += self._enter(symbol, risk.qty, decision, bar_ts, ref, price)
 
         elif decision.signal is SignalType.EXIT_LONG and held > 0:
-            self._exit(symbol, held, decision, bar_ts)
+            self._exit(symbol, held, decision, bar_ts, (pos_by_symbol or {}).get(symbol))
             # Free the value we SEEDED for this symbol (market_value basis), not a bar-close
             # estimate, so the tally returns to its true post-exit level.
             running_exposure -= (position_mv or {}).get(symbol, held * decision.price)
@@ -392,18 +395,14 @@ class TradingBot:
             return 0.0
         return qty * price
 
-    def _exit(self, symbol, held, decision: SignalDecision, bar_ts) -> None:
+    def _exit(self, symbol, held, decision: SignalDecision, bar_ts, pos=None) -> None:
         """Exit via a deterministic-coid SELL (not close_position) so it dedupes and
         reconciles exactly like an entry — a retried/crashed exit can't double-sell. If a
         prior exit for this bar terminated UNFILLED (rejected/canceled/expired), retry with a
         fresh coid so a wanted liquidation isn't abandoned for the rest of the day; the
-        caller's held>0 gate stops a double-sell once one attempt fills."""
-        # Snapshot the position BEFORE closing — its unrealized P&L is what we realize by
-        # selling at market — so the activity feed can report the trade's profit/loss.
-        try:
-            pos = self.broker.get_position(symbol)
-        except Exception:
-            pos = None
+        caller's held>0 gate stops a double-sell once one attempt fills. ``pos`` is the
+        pre-close position snapshot (from step()'s positions read) used only to report realized
+        P&L on the activity feed — NEVER fetched here, so a cosmetic read can't delay the exit."""
         coid, retry = self._retry_coid(symbol, "sell", bar_ts)
         with self._lock:
             if not retry and self.ledger.already_submitted(coid):
@@ -411,9 +410,17 @@ class TradingBot:
             self.ledger.record_intent(coid, symbol, "sell", held, decision.reason)
             order = self.broker.submit_market(symbol, held, OrderSide.SELL, client_order_id=coid)
             self.ledger.mark_submitted(coid, str(order.id))
-        self._await_fill(coid)
+        filled, status = self._await_fill(coid)
         self.log.info("%s: EXIT sell qty=%s (coid=%s)", symbol, held, coid)
-        self.alerter.activity(self._sell_activity(symbol, held, pos))
+        # Trade-activity feed — gate on the ACTUAL fill (mirror _enter): a rejected/unfilled exit
+        # must NOT post a confident "SOLD ... P&L" that contradicts the still-held position and
+        # the concurrent 'order rejected' alert.
+        if filled > 0:
+            self.alerter.activity(self._sell_activity(symbol, filled, pos))
+        elif status in (None, *_TERMINAL_UNFILLED):
+            self.alerter.activity(f"⚠️ {symbol} SELL {status or 'no order'} — NOT filled, still holding {held:g}")
+        else:
+            self.alerter.activity(f"🔴 SELL {held:g} {symbol} submitted @ market — awaiting fill")
 
     @staticmethod
     def _sell_activity(symbol, qty, pos) -> str:
