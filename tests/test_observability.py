@@ -68,6 +68,23 @@ def test_activity_goes_to_webhooks_not_email(monkeypatch):
     assert calls == {"email": 0, "discord": 1}
 
 
+def test_discord_sends_user_agent_header(monkeypatch):
+    # Discord's API is behind Cloudflare and returns HTTP 403 without a User-Agent header.
+    seen = {}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b""
+
+    def fake(req, timeout=None):
+        seen["ua"] = req.get_header("User-agent")
+        return _Resp()
+    monkeypatch.setattr("urllib.request.urlopen", fake)
+    Alerter(AlertConfig(discord_webhook_url="https://discord.test/wh"))._discord("hi")
+    assert seen["ua"]  # must be a non-empty User-Agent, or Discord 403s
+
+
 def test_alerter_never_raises_on_transport_failure(monkeypatch):
     def boom(req, timeout=None):
         raise RuntimeError("network down")

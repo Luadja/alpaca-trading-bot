@@ -82,11 +82,12 @@ class Alerter:
 
     def _discord(self, text: str) -> None:
         # Discord incoming webhook: {"content": "..."} (max 2000 chars). One-way push, no bot
-        # token / gateway needed.
+        # token / gateway needed. Discord's API is behind Cloudflare and REQUIRES a User-Agent
+        # header — without it the request is rejected with HTTP 403.
         payload = json.dumps({"content": text[:1990]}).encode("utf-8")
         req = urllib.request.Request(
             self.config.discord_webhook_url, data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": "alpaca-trading-bot/1.0"},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 (config URL)
             resp.read()
