@@ -195,6 +195,11 @@ def main() -> None:
         else:
             print(f"  skip {sym}: {len(df)} bars")
 
+    if not bars:
+        raise SystemExit(
+            "No symbols had enough history to validate (need >=200 bars). "
+            "Check the data feed, universe, and --years-back."
+        )
     is_start = str(min(d.index.min() for d in bars.values()).date())  # basket-wide earliest
     is_end = args.is_end
     oos_start, oos_end = args.is_end, "2027-01-01"
@@ -257,8 +262,12 @@ def main() -> None:
     ann = _periods_per_year(args.timeframe) ** 0.5
     trial_sharpes = [m["sharpe"] / ann for m in is_agg.values()]
     observed = is_agg[best_key]["sharpe"] / ann
-    sample_df = next(iter(bars.values()))
-    n_obs = int(((sample_df.index >= _ts(is_start)) & (sample_df.index < _ts(is_end))).sum())
+    # n_obs bounds the DSR's confidence; use the basket-MINIMUM in-sample bar count (the
+    # shortest series), not one arbitrary symbol's, so we never overstate the sample size.
+    def _is_bars(df) -> int:
+        return int(((df.index >= _ts(is_start)) & (df.index < _ts(is_end))).sum())
+
+    n_obs = min(_is_bars(df) for df in bars.values())
     sr0 = expected_max_sharpe(trial_sharpes)
     dsr = deflated_sharpe(observed, trial_sharpes, n_obs)
     print(f"\nIS-best chosen: {best_key}")

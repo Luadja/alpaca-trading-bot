@@ -46,7 +46,8 @@ def _retry(fn, *, tries: int = 5, base: float = 1.0):
             last_exc = exc
         except (ConnectionError, TimeoutError, OSError) as exc:
             last_exc = exc
-        time.sleep(min(30.0, base * (2 ** attempt) + random.uniform(0.0, 0.5)))
+        if attempt < tries - 1:  # no point sleeping after the last attempt — we're about to raise
+            time.sleep(min(30.0, base * (2 ** attempt) + random.uniform(0.0, 0.5)))
     assert last_exc is not None
     raise last_exc
 

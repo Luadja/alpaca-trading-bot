@@ -86,6 +86,12 @@ def main() -> None:
         if not df.empty and len(df) >= 200:
             bars[sym] = df
 
+    if not bars:
+        raise SystemExit(
+            "No symbols had enough history to validate (need >=200 bars). "
+            "Check the data feed, universe, and --years-back."
+        )
+
     grid = build_grid()
     sig_cache = {(sym, pkey(p)): compute(df, p)["signal"] for sym, df in bars.items() for p in grid}
 

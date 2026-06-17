@@ -48,6 +48,14 @@ class TrendMomentumParams:
     # Enter when ALREADY in an uptrend (fast > slow), not only on a fresh golden cross — so
     # a freshly-started bot can adopt an in-progress trend instead of sitting out. Off by
     # default (changes signal counts; validate first).
+    #
+    # LIVE LIMITATION: compute_signals emits the +1 at the bar where the state ENTRY first
+    # becomes valid (the simulated transition), then holds. The live path reads only the LAST
+    # bar (generate -> iloc[-1]), so if the uptrend began earlier in the loaded history the
+    # last bar is a HOLD and a fresh bot will NOT adopt the in-progress trend — the opposite
+    # of the intent. Making this work live requires reconciling the strategy's simulated
+    # in_pos against the actual broker position in the execution layer (run.py); until that
+    # exists, leave this OFF for live trading. It is sound for backtests, which replay every bar.
     enter_on_regime: bool = False
 
     @property

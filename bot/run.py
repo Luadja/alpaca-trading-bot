@@ -69,9 +69,15 @@ def _avg_price(order) -> float | None:
 
 
 class TradingBot:
+    # Consecutive heartbeat-write failures at which we escalate warning -> critical: a
+    # persistent failure means the watchdog's dead-man's-switch will soon flatten on a stale
+    # heartbeat, so it's no longer a transient blip.
+    _HEARTBEAT_FAIL_ESCALATE = 3
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.log = setup_logging()
+        self._heartbeat_failures = 0  # consecutive write failures, for escalation
         # Serializes the kill-switch / risk-state / order-submit critical sections so the
         # fast safety_poll thread can't flatten between an entry's gate-check and its submit.
         self._lock = threading.RLock()
@@ -122,9 +128,9 @@ class TradingBot:
             if halted:
                 self.broker.flatten_all()
         if halted:
-            pnl = self.risk.daily_pnl_pct(account.equity) * 100
-            self.log.warning("KILL SWITCH active (daily P&L %.2f%%) — flattened, no new entries.", pnl)
-            self.alerter.notify("critical", "kill switch tripped — account flattened", f"daily P&L {pnl:.2f}%")
+            reason = self.risk.halt_reason(account.equity)
+            self.log.warning("KILL SWITCH active (%s) — flattened, no new entries.", reason)
+            self.alerter.notify("critical", "kill switch tripped — account flattened", reason)
             self._write_heartbeat(account.equity)
             return
 
@@ -173,10 +179,22 @@ class TradingBot:
                     p.symbol, entry, price, pct,
                 )
                 self.alerter.notify("warning", f"catastrophic stop: {p.symbol}", f"{pct:.1f}% from entry")
-                self.broker.close_position(p.symbol)
+                self._flatten_catastrophic(p.symbol, float(p.qty))
                 stopped.add(p.symbol)
                 positions[p.symbol] = 0.0
         return stopped
+
+    def _flatten_catastrophic(self, symbol: str, qty: float) -> None:
+        """Flatten a position that breached the HARD stop, through the ledger (audit trail +
+        fill verification + crash-recovery), exactly like a normal exit. Uses a UNIQUE coid
+        each fire and is NOT gated by already_submitted: safety must always flatten, even if a
+        prior stop order for this symbol was rejected, so it must never dedupe itself away."""
+        coid = f"bot-catstop-{symbol}-{time.time_ns()}"
+        with self._lock:
+            self.ledger.record_intent(coid, symbol, "sell", qty, "catastrophic stop")
+            order = self.broker.submit_market(symbol, qty, OrderSide.SELL, client_order_id=coid)
+            self.ledger.mark_submitted(coid, str(order.id))
+        self._await_fill(coid)
 
     def _evaluate_symbol(self, symbol, equity, positions, running_exposure, regime_ok=True,
                          position_mv=None) -> float:
@@ -237,9 +255,15 @@ class TradingBot:
             else:
                 order = self.broker.submit_market(symbol, qty, OrderSide.BUY, client_order_id=coid)
             self.ledger.mark_submitted(coid, str(order.id))
-        filled = self._await_fill(coid)
+        filled, status = self._await_fill(coid)
         self.log.info("%s: BUY %s/%s filled (coid=%s)", symbol, filled, qty, coid)
-        return qty * decision.price  # committed notional (conservative for the gate)
+        # Count committed notional for the exposure gate. A working/resting limit or any
+        # (partial) fill counts (conservative). But an order that reached a terminal state
+        # with ZERO fill (rejected/canceled/expired) — or that the broker has no record of —
+        # commits nothing, so don't let a dead order block legitimate same-cycle entries.
+        if filled == 0 and status in (None, "rejected", "canceled", "expired", "done_for_day"):
+            return 0.0
+        return qty * decision.price
 
     def _exit(self, symbol, held, decision: SignalDecision, bar_ts) -> None:
         """Exit via a deterministic-coid SELL (not close_position) so it dedupes and
@@ -254,15 +278,17 @@ class TradingBot:
         self._await_fill(coid)
         self.log.info("%s: EXIT sell qty=%s (coid=%s)", symbol, held, coid)
 
-    def _await_fill(self, coid: str, tries: int = 4, pause: float = 1.0) -> float:
-        """Poll the order to terminal state, recording fills. Returns filled qty (may be
-        partial). Replaced by TradingStream later; REST polling is the fallback."""
+    def _await_fill(self, coid: str, tries: int = 4, pause: float = 1.0) -> tuple[float, str | None]:
+        """Poll the order to terminal state, recording fills. Returns (filled qty, last status)
+        — status is None if the broker has no record, or the last non-terminal status if it
+        never settled (a working limit). Replaced by TradingStream later; REST is the fallback."""
         terminal = {"filled", "canceled", "rejected", "expired", "done_for_day"}
         filled = 0.0
+        status: str | None = None
         for attempt in range(tries):
             order = self.broker.get_order(coid)
             if order is None:
-                return 0.0
+                return 0.0, None
             status = order.status.value if hasattr(order.status, "value") else str(order.status)
             filled = float(order.filled_qty or 0)
             self.ledger.record_fill(coid, filled, _avg_price(order), status)
@@ -270,19 +296,22 @@ class TradingBot:
                 if status != "filled":
                     self.log.warning("%s: order %s — filled %s", coid, status, filled)
                     self.alerter.notify("warning", f"order {status}", f"{coid} filled {filled}")
-                return filled
+                return filled, status
             if attempt < tries - 1:
                 time.sleep(pause)
-        return filled
+        return filled, status
 
     def _maybe_roll_day(self, equity: float) -> None:
         today = _trading_date()
-        if today == self._session_date:
+        if today == self._session_date:  # fast path, no lock
             return
-        prev = self._session_date
-        # Under the lock so a concurrent safety_poll can't snapshot a half-rolled state.
-        # Per-horizon latches make the reset order irrelevant.
+        # Double-checked locking: step() and safety_poll() run on separate threads and BOTH
+        # call this, so the check+act must be atomic or they'd double-roll (re-clearing a
+        # just-tripped latch / re-anchoring to a second, lower equity read).
         with self._lock:
+            prev = self._session_date
+            if today == prev:
+                return  # another thread already rolled this session
             if today.isocalendar()[:2] != prev.isocalendar()[:2]:
                 self.risk.reset_week(equity)
             if (today.year, today.month) != (prev.year, prev.month):
@@ -290,7 +319,7 @@ class TradingBot:
             self.risk.reset_day(equity)
             self._session_date = today
             self._persist_risk()
-        self.log.info("New trading day %s — anchors rolled; halted=%s", today, self.risk.halted)
+            self.log.info("New trading day %s — anchors rolled; halted=%s", today, self.risk.halted)
 
     def _build_strategy(self):
         """Construct the configured strategy, injecting settings-driven params."""
@@ -394,9 +423,9 @@ class TradingBot:
                 if halted:
                     self.broker.flatten_all()
             if halted:
-                pnl = self.risk.daily_pnl_pct(equity) * 100
-                self.log.warning("SAFETY POLL kill switch (daily P&L %.2f%%) — flattened", pnl)
-                self.alerter.notify("critical", "kill switch tripped (safety poll) — flattened", f"daily P&L {pnl:.2f}%")
+                reason = self.risk.halt_reason(equity)
+                self.log.warning("SAFETY POLL kill switch (%s) — flattened", reason)
+                self.alerter.notify("critical", "kill switch tripped (safety poll) — flattened", reason)
             self._write_heartbeat(equity)
         except Exception:
             self.log.exception("safety poll error")
@@ -407,10 +436,18 @@ class TradingBot:
             payload["equity"] = equity
         try:
             write_heartbeat(self.settings.heartbeat_path, payload)
+            if self._heartbeat_failures:
+                self.log.info("heartbeat write recovered after %d failure(s)", self._heartbeat_failures)
+            self._heartbeat_failures = 0
         except Exception as exc:  # heartbeat write must never break the cycle
-            self.log.exception("heartbeat write failed")
-            # A persistent write failure makes the watchdog flatten; surface the root cause.
-            self.alerter.notify("warning", "heartbeat write failed", str(exc))
+            self._heartbeat_failures += 1
+            self.log.exception("heartbeat write failed (%d consecutive)", self._heartbeat_failures)
+            # First blips are warnings; a persistent failure makes the watchdog flatten on a
+            # stale heartbeat, so escalate to critical once it crosses the threshold.
+            sev = "critical" if self._heartbeat_failures >= self._HEARTBEAT_FAIL_ESCALATE else "warning"
+            self.alerter.notify(
+                sev, "heartbeat write failed", f"{self._heartbeat_failures} consecutive: {exc}"
+            )
 
     @staticmethod
     def _coid(symbol: str, side: str, bar_ts) -> str:

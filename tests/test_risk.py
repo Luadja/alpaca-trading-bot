@@ -106,6 +106,39 @@ def test_vol_targeting_off_ignores_sigma():
     assert rm.position_size(equity=100_000, price=100, sigma=0.25) == 100
 
 
+def test_halt_reason_names_the_breached_horizon():
+    # The kill-switch log/alert must report the horizon that ACTUALLY tripped, not always
+    # "daily". A weekly-only breach should name week (and its %), not day.
+    rm = RiskManager(
+        RiskConfig(max_daily_loss_pct=0.50, max_weekly_loss_pct=0.06, max_monthly_loss_pct=0.50),
+        day_start_equity=100_000,
+    )
+    rm.update(93_000)  # -7% vs week start: weekly latch only (daily/monthly thresholds are 50%)
+    assert rm.halted
+    reason = rm.halt_reason(93_000)
+    assert "week" in reason and "-7.00%" in reason
+    assert "day" not in reason and "month" not in reason
+
+
+def test_halt_reason_reports_all_latched_horizons():
+    rm = RiskManager(
+        RiskConfig(max_daily_loss_pct=0.03, max_weekly_loss_pct=0.06, max_monthly_loss_pct=0.10),
+        day_start_equity=100_000,
+    )
+    rm.update(88_000)  # -12%: trips day, week AND month at once
+    reason = rm.halt_reason(88_000)
+    assert "day" in reason and "week" in reason and "month" in reason
+
+
+def test_per_horizon_pnl_helpers():
+    rm = RiskManager(RiskConfig(), day_start_equity=100_000)
+    rm.reset_week(50_000)
+    rm.reset_month(200_000)
+    assert rm.daily_pnl_pct(90_000) == pytest.approx(-0.10)
+    assert rm.weekly_pnl_pct(45_000) == pytest.approx(-0.10)
+    assert rm.monthly_pnl_pct(180_000) == pytest.approx(-0.10)
+
+
 def test_catastrophic_stop_triggers_below_threshold():
     rm = RiskManager(RiskConfig(catastrophic_stop_pct=0.10), 100_000)
     assert rm.should_stop_out(entry_price=100, current_price=89)  # -11% -> stop

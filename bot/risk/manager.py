@@ -75,6 +75,23 @@ class RiskManager:
     def daily_pnl_pct(self, equity: float) -> float:
         return (equity - self.day_start_equity) / self.day_start_equity
 
+    def weekly_pnl_pct(self, equity: float) -> float:
+        return (equity - self.week_start_equity) / self.week_start_equity
+
+    def monthly_pnl_pct(self, equity: float) -> float:
+        return (equity - self.month_start_equity) / self.month_start_equity
+
+    def halt_reason(self, equity: float) -> str:
+        """Human-readable reason naming the horizon(s) actually latched (not always daily)."""
+        parts = []
+        if self._halted_day:
+            parts.append(f"day {self.daily_pnl_pct(equity) * 100:.2f}%")
+        if self._halted_week:
+            parts.append(f"week {self.weekly_pnl_pct(equity) * 100:.2f}%")
+        if self._halted_month:
+            parts.append(f"month {self.monthly_pnl_pct(equity) * 100:.2f}%")
+        return ", ".join(parts) or "loss limit"
+
     def breached_daily_loss(self, equity: float) -> bool:
         return self.daily_pnl_pct(equity) <= -self.config.max_daily_loss_pct
 
