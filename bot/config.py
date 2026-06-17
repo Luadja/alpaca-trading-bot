@@ -100,11 +100,16 @@ class Settings(BaseSettings):
     @field_validator("feed")
     @classmethod
     def _feed_known(cls, v: str) -> str:
-        # Fail closed: an ALPACA_FEED typo must not silently degrade to thin IEX (~3% of
-        # volume), which would compute the 50/200 SMAs off sparse bars.
+        # Fail closed on an unknown feed (a typo must not silently degrade to thin IEX).
+        # 'delayed_sip' is REJECTED: the bars endpoint returns "invalid feed" for it. Use 'sip',
+        # which is free on the Basic plan for data >=15min old (the 16-min end clamp guarantees
+        # this); the live price anchor falls back to real-time IEX so the slippage cap still works.
         fv = v.strip().lower()
-        if fv not in {"iex", "sip", "delayed_sip"}:
-            raise ValueError("ALPACA_FEED must be one of: iex, sip, delayed_sip")
+        if fv not in {"iex", "sip"}:
+            raise ValueError(
+                "ALPACA_FEED must be 'iex' or 'sip' ('delayed_sip' is invalid for the bars "
+                "endpoint; 'sip' is free for data older than 15 minutes)."
+            )
         return fv
 
     @field_validator("ledger_path", "heartbeat_path")

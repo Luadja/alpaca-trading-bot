@@ -26,6 +26,23 @@ def test_empty_symbols_rejected_via_env(monkeypatch):
     raise AssertionError("empty BOT_SYMBOLS should be rejected")
 
 
+def test_feed_validator_accepts_sip_iex_rejects_delayed_sip(monkeypatch):
+    for good, want in (("sip", "sip"), ("IEX", "iex")):  # accepted (and normalized)
+        monkeypatch.setenv("ALPACA_FEED", good)
+        assert Settings(_env_file=None, api_key="x", api_secret="y").feed == want
+        monkeypatch.delenv("ALPACA_FEED", raising=False)
+    # 'delayed_sip' is rejected by the Alpaca bars endpoint, so the validator must reject it.
+    for bad in ("delayed_sip", "sipp", ""):
+        monkeypatch.setenv("ALPACA_FEED", bad)
+        try:
+            Settings(_env_file=None, api_key="x", api_secret="y")
+        except Exception as exc:
+            assert "feed" in str(exc).lower()
+        else:
+            raise AssertionError(f"feed={bad!r} should be rejected")
+        monkeypatch.delenv("ALPACA_FEED", raising=False)
+
+
 def test_negative_slippage_cap_rejected(monkeypatch):
     monkeypatch.setenv("BOT_SLIPPAGE_CAP_PCT", "-0.01")  # would price the buy below market
     try:

@@ -98,19 +98,28 @@ class HistoricalData:
     def latest_price(self, symbol: str) -> float | None:
         """Most recent trade price for anchoring marketable limits; None on any error, a
         non-positive price, OR a stale print, so the caller can fall back to a market order
-        rather than anchoring on a stale (e.g. prior-session) price that would never fill."""
-        try:
-            req = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=self._anchor_feed)
-            trade = self.client.get_stock_latest_trade(req)[symbol]
-            price = float(trade.price)
-            if price <= 0:
-                return None
-            ts = getattr(trade, "timestamp", None)
-            if ts is not None and (datetime.now(timezone.utc) - ts).total_seconds() > self._ANCHOR_MAX_AGE_S:
-                return None  # stale print -> don't anchor a live limit on it
-            return price
-        except Exception:
-            return None
+        rather than anchoring on a stale (e.g. prior-session) price that would never fill.
+
+        Tries the configured real-time feed first, then free real-time IEX — so a free-tier
+        account on feed='sip' (whose real-time SIP trade endpoint is paid-only) still gets a
+        live anchor from IEX instead of silently degrading every entry to a market order."""
+        feeds = [self._anchor_feed]
+        if DataFeed.IEX not in feeds:
+            feeds.append(DataFeed.IEX)
+        for feed in feeds:
+            try:
+                req = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=feed)
+                trade = self.client.get_stock_latest_trade(req)[symbol]
+                price = float(trade.price)
+                if price <= 0:
+                    continue
+                ts = getattr(trade, "timestamp", None)
+                if ts is not None and (datetime.now(timezone.utc) - ts).total_seconds() > self._ANCHOR_MAX_AGE_S:
+                    continue  # stale on this feed -> try the next
+                return price
+            except Exception:
+                continue  # feed unavailable (e.g. unpaid SIP real-time) -> try the next
+        return None
 
     def get_bars(
         self,
