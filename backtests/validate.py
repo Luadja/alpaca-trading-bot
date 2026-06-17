@@ -91,15 +91,41 @@ def _metrics(stats) -> dict:
     }
 
 
+def _carry_in_signals(signals: pd.Series, mask: pd.Series) -> pd.Series:
+    """Slice signals to the window, seeding a carry-in +1 on the first in-window bar when the
+    strategy was ALREADY long entering the window (an unmatched +1 before it).
+
+    trend_momentum's signals are path-dependent (+1 only on the entry bar, -1 only on exit), so
+    a naive slice DROPS a trade whose entry predates the window start and whose exit follows it
+    — exactly the long trends trend-following lives on — biasing the OOS / walk-forward grade.
+    Causal: uses only pre-window bars, so it introduces no look-ahead."""
+    w = signals.loc[mask].copy()
+    if w.empty:
+        return w
+    pos = 0
+    for v in signals.loc[signals.index < w.index[0]].to_numpy():
+        if v == 1:
+            pos = 1
+        elif v == -1:
+            pos = 0
+    if pos == 1 and int(w.iloc[0]) == 0:
+        w.iloc[0] = 1  # carried-in long: enter at the window's first bar so the trade isn't lost
+    return w
+
+
 def _run_window(df, signals, start, end, cash, commission):
     mask = (df.index >= _ts(start)) & (df.index < _ts(end))
     if mask.sum() < 30:
         return None
     return Backtest(
-        _bt_df(df.loc[mask], signals.loc[mask]),
+        _bt_df(df.loc[mask], _carry_in_signals(signals, mask)),
         SrsiMfiBacktest,
         cash=cash,
         commission=commission,
+        # Fill on the just-CLOSED signal bar (T+0), matching the live path which acts on the
+        # last closed bar — not backtesting.py's default next-bar-open (T+1), which would grade
+        # the strategy on returns the bot never earns.
+        trade_on_close=True,
     ).run()
 
 
@@ -236,6 +262,11 @@ def main() -> None:
         key=lambda kv: kv[1]["sharpe"] if not np.isnan(kv[1]["sharpe"]) else -9,
         reverse=True,
     )
+    if not ranked:
+        raise SystemExit(
+            "No in-sample records: the IS window has <30 bars for every symbol. "
+            "Check --is-end vs --years-back (and that is_start < is_end)."
+        )
     # Sharpe-ranking alone rewards near-inactive configs (tiny drawdown). Require a
     # minimum trade count so the chosen "best" is actually an active strategy.
     eligible = [(k, m) for k, m in ranked if m["trades"] >= args.min_trades]
@@ -262,12 +293,15 @@ def main() -> None:
     ann = _periods_per_year(args.timeframe) ** 0.5
     trial_sharpes = [m["sharpe"] / ann for m in is_agg.values()]
     observed = is_agg[best_key]["sharpe"] / ann
-    # n_obs bounds the DSR's confidence; use the basket-MINIMUM in-sample bar count (the
-    # shortest series), not one arbitrary symbol's, so we never overstate the sample size.
+    # n_obs bounds the DSR's confidence. Use the MEDIAN in-sample bar count over symbols that
+    # actually CONTRIBUTED records (>=30 IS bars), not the basket minimum: a single recently
+    # listed / short-history symbol would otherwise collapse n_obs and pin DSR to ~0 so no
+    # config can ever be blessed (and a 0-IS-bar symbol would understate it further).
     def _is_bars(df) -> int:
         return int(((df.index >= _ts(is_start)) & (df.index < _ts(is_end))).sum())
 
-    n_obs = min(_is_bars(df) for df in bars.values())
+    contrib = sorted(c for c in (_is_bars(df) for df in bars.values()) if c >= 30)
+    n_obs = contrib[len(contrib) // 2] if contrib else 0
     sr0 = expected_max_sharpe(trial_sharpes)
     dsr = deflated_sharpe(observed, trial_sharpes, n_obs)
     print(f"\nIS-best chosen: {best_key}")

@@ -98,7 +98,8 @@ def main() -> None:
         for p in grid:
             signals = compute(df, p)["signal"]
             stats = Backtest(
-                _bt_df(df, signals), SrsiMfiBacktest, cash=args.cash, commission=args.commission
+                _bt_df(df, signals), SrsiMfiBacktest, cash=args.cash, commission=args.commission,
+                trade_on_close=True,  # T+0 fill on the signal bar's close, matching live
             ).run()
             n = int(stats["# Trades"])
             rows.append(
