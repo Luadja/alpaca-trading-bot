@@ -103,6 +103,66 @@ def weights_dual_momentum(
     return w.ffill().fillna(0.0)
 
 
+def momentum_score(panel: pd.DataFrame, lookbacks=(252,), skip: int = 21) -> pd.DataFrame:
+    """(Blended) momentum: average of trailing returns over each lookback, skipping the last
+    `skip` days (12-1 style). Multiple lookbacks => a more robust, less single-window signal.
+    Causal (only past closes)."""
+    parts = [panel.shift(skip) / panel.shift(lb) - 1.0 for lb in lookbacks]
+    return sum(parts) / len(parts)
+
+
+def weights_xsec(panel: pd.DataFrame, lookbacks=(252,), skip: int = 21, top_n: int = 4,
+                 rebalance_days: int = 21, scheme: str = "equal", vol_lookback: int = 60) -> pd.DataFrame:
+    """Generalized cross-sectional momentum: rank by (blended) momentum, hold the top_n,
+    weighted equal or inverse-vol (``scheme``), rebalance every ``rebalance_days``. Causal."""
+    mom = momentum_score(panel, lookbacks, skip)
+    vol = panel.pct_change().rolling(vol_lookback).std()
+    w = pd.DataFrame(np.nan, index=panel.index, columns=panel.columns)
+    for d in panel.index[::rebalance_days]:
+        row = mom.loc[d].dropna()
+        w.loc[d] = 0.0
+        if len(row):
+            top = row.nlargest(min(top_n, len(row))).index
+            if scheme == "invvol":
+                iv = (1.0 / vol.loc[d, top]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                w.loc[d, top] = (iv / iv.sum()).values if iv.sum() > 0 else 1.0 / len(top)
+            else:
+                w.loc[d, top] = 1.0 / top_n
+    return w.ffill().fillna(0.0)
+
+
+def weights_risk_parity(panel: pd.DataFrame, vol_lookback: int = 60, rebalance_days: int = 21) -> pd.DataFrame:
+    """'Smarter buy & hold': hold ALL assets weighted inversely to trailing vol (down-weight the
+    jumpy ones), rebalanced periodically. No timing/momentum. Causal."""
+    inv = (1.0 / panel.pct_change().rolling(vol_lookback).std()).replace([np.inf, -np.inf], np.nan)
+    w = inv.div(inv.sum(axis=1), axis=0)
+    reb = panel.index[::rebalance_days]
+    return w.loc[reb].reindex(panel.index).ffill().fillna(0.0)
+
+
+def vol_target(weights: pd.DataFrame, panel: pd.DataFrame, target_vol: float = 0.10,
+               vol_lookback: int = 60, max_gross: float = 2.0) -> pd.DataFrame:
+    """CONTROLLED-LEVERAGE overlay: scale a base strategy's gross exposure each day toward a
+    target annualized vol, using its own TRAILING realized vol (causal), capped at max_gross.
+    Levers up in calm regimes, down in stormy ones. This is the honest 'more return via more
+    (managed) risk' lever — it WILL deepen drawdowns when vol estimates lag a crash."""
+    base_net = backtest(weights, panel, 0.0).net_returns
+    rv = base_net.rolling(vol_lookback).std() * np.sqrt(252)
+    scale = (target_vol / rv).clip(upper=max_gross).replace([np.inf, -np.inf], np.nan)
+    scale = scale.reindex(weights.index).ffill().fillna(1.0)
+    return weights.mul(scale, axis=0)
+
+
+def blend(*weighted) -> pd.DataFrame:
+    """Convex blend of strategies: blend((w1, 0.5), (w2, 0.5)) -> 0.5*w1 + 0.5*w2."""
+    total = sum(frac for _, frac in weighted)
+    out = None
+    for w, frac in weighted:
+        term = w * (frac / total)
+        out = term if out is None else out.add(term, fill_value=0.0)
+    return out.fillna(0.0)
+
+
 def weights_equal_buy_hold(panel: pd.DataFrame) -> pd.DataFrame:
     """Benchmark: hold every symbol at 1/N, rebalanced daily (the 'just own the universe' line)."""
     n = panel.shape[1]

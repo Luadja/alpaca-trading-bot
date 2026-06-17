@@ -16,8 +16,7 @@ import warnings
 import numpy as np
 
 from backtests import portfolio as pf
-from backtests.research_portfolio import load_bars
-from backtests.universe import resolve_universe
+from backtests.research_profit import get_panel
 from backtests.walk_forward import _fold_windows
 
 warnings.filterwarnings("ignore")
@@ -55,10 +54,8 @@ def main() -> None:
     global _BUILDER
     _BUILDER = BUILDERS[args.strategy]
 
-    symbols, _, _ = resolve_universe(args.universe)
-    bars, feed = load_bars(symbols, args.years_back, "1Day")
-    panel = pf.build_panel(bars)
-    print(f"STRATEGY={args.strategy} | {len(bars)} symbols via {feed}; panel {panel.index[0].date()} -> "
+    panel, src = get_panel(args.universe, args.years_back, refresh=False)  # cache-aware (no API on hit)
+    print(f"STRATEGY={args.strategy} | {panel.shape[1]} symbols ({src}); panel {panel.index[0].date()} -> "
           f"{panel.index[-1].date()} ({len(panel)} days); cost {args.cost*1e4:.0f}bps/side\n")
 
     bench_net = pf.backtest(pf.weights_equal_buy_hold(panel), panel, args.cost).net_returns

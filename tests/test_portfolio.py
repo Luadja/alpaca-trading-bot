@@ -85,6 +85,38 @@ def test_dual_momentum_cash_filter():
     assert w_dn.iloc[-1].sum() == 0.0
 
 
+def test_vol_target_scales_gross_inversely_to_vol():
+    # Calm asset -> low realized vol -> overlay levers gross UP toward the target (capped).
+    idx = _idx(300)
+    t = np.arange(300)
+    calm = pd.DataFrame({"A": 100 * 1.0002 ** t}, index=idx)  # smooth, very low vol
+    base = pf.weights_equal_buy_hold(calm)  # gross 1.0
+    scaled = pf.vol_target(base, calm, target_vol=0.10, vol_lookback=60, max_gross=3.0)
+    assert scaled.iloc[-1].sum() > 1.0  # low-vol regime -> levered above 1x (toward target)
+    assert scaled.iloc[-1].sum() <= 3.0 + 1e-9  # never exceeds the cap
+
+
+def test_xsec_invvol_tilts_to_low_vol_within_topn():
+    idx = _idx(300)
+    t = np.arange(300)
+    a = 100 * 1.0015 ** t                                  # strong, smooth (low vol)
+    b = 100 * 1.0015 ** t * (1 + 0.05 * np.sin(t / 3.0))   # strong, jagged (high vol)
+    panel = pd.DataFrame({"A": a, "B": b}, index=idx)
+    w = pf.weights_xsec(panel, lookbacks=(60,), skip=2, top_n=2, rebalance_days=5,
+                        scheme="invvol", vol_lookback=60).iloc[-1]
+    assert abs(w.sum() - 1.0) < 1e-6 and w["A"] > w["B"]  # both held, tilted to lower-vol A
+
+
+def test_risk_parity_underweights_volatile_asset():
+    idx = _idx(120)
+    t = np.arange(120)
+    a = 100 * 1.0005 ** t                                  # low vol
+    b = 100 * 1.0005 ** t * (1 + 0.06 * np.sin(t / 2.0))   # high vol
+    panel = pd.DataFrame({"A": a, "B": b}, index=idx)
+    w = pf.weights_risk_parity(panel, vol_lookback=40, rebalance_days=5).iloc[-1]
+    assert abs(w.sum() - 1.0) < 1e-6 and w["A"] > w["B"]
+
+
 def test_build_panel_inner_join():
     a = pd.DataFrame({"close": [1, 2, 3]}, index=_idx(3))
     b = pd.DataFrame({"close": [10, 20]}, index=_idx(2, "2020-01-02"))  # offset by a day

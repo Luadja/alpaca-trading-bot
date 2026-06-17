@@ -43,6 +43,15 @@ MULTI_ASSET = [
 ]
 
 
+# Survivorship-FREE, WIDE: multi-asset + sector + factor ETFs (~25 names) — more cross-sectional
+# dispersion for momentum to rank across. All have history before the 2016 data start.
+WIDE = [
+    "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "IEF", "LQD", "HYG", "GLD", "DBC", "VNQ",
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLU", "XLY", "XLB",
+    "MTUM", "QUAL", "VLUE", "USMV",  # factor ETFs (momentum/quality/value/min-vol)
+]
+
+
 def load_universe_csv(path: str) -> tuple[list[str], dict[str, tuple[date, date]]]:
     """Load a point-in-time universe CSV (rows: ``symbol,start,end`` ISO dates; a header
     row named 'symbol' is skipped). Returns (symbols, windows) where windows maps each
@@ -67,6 +76,8 @@ def resolve_universe(spec: str) -> tuple[list[str], dict[str, tuple[date, date]]
         return ETF_UNIVERSE, None, False
     if spec in ("multiasset", "multi_asset", "broad"):
         return MULTI_ASSET, None, False
+    if spec == "wide":
+        return WIDE, None, False
     if spec == "megacap":
         return MEGACAP_BIASED, None, True
     if Path(spec).is_file():
