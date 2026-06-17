@@ -49,12 +49,20 @@ def setup_logging(
         )
     )
 
+    # UTF-8 everywhere so emoji / em-dashes in messages neither raise nor mojibake on Windows
+    # (the console + default file encoding are cp1252 there).
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:  # pragma: no cover - best effort
+            pass
+
     stream = logging.StreamHandler(sys.stdout)
     stream.setFormatter(fmt)
     logger.addHandler(stream)
 
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-    file_handler = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=5)
+    file_handler = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
     file_handler.setFormatter(fmt)
     logger.addHandler(file_handler)
 

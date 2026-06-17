@@ -26,6 +26,7 @@ def format_alert(level: str, event: str, detail: str = "") -> str:
 @dataclass
 class AlertConfig:
     slack_webhook_url: str = ""
+    discord_webhook_url: str = ""
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_user: str = ""
@@ -40,7 +41,7 @@ class Alerter:
     @property
     def enabled(self) -> bool:
         c = self.config
-        return bool(c.slack_webhook_url or (c.smtp_host and c.email_to))
+        return bool(c.slack_webhook_url or c.discord_webhook_url or (c.smtp_host and c.email_to))
 
     def notify(self, level: str, event: str, detail: str = "") -> None:
         """Best-effort alert: always logs, sends to configured backends, never raises."""
@@ -51,15 +52,40 @@ class Alerter:
         try:
             if self.config.slack_webhook_url:
                 self._slack(text)
+            if self.config.discord_webhook_url:
+                self._discord(text)
             if self.config.smtp_host and self.config.email_to:
                 self._email(f"[bot] {level}: {event}", text)
         except Exception:  # alerting must never take down the bot
             log.exception("alert delivery failed (event=%s)", event)
 
+    def activity(self, message: str) -> None:
+        """Routine trade-activity feed (fills, P&L, lifecycle) -> chat webhooks only, NOT email
+        (per-trade email would be spam). Always logs; never raises."""
+        log.info("ACTIVITY %s", message)
+        try:
+            if self.config.slack_webhook_url:
+                self._slack(message)
+            if self.config.discord_webhook_url:
+                self._discord(message)
+        except Exception:  # activity feed must never take down the trade path
+            log.exception("activity delivery failed")
+
     def _slack(self, text: str) -> None:
         payload = json.dumps({"text": text}).encode("utf-8")
         req = urllib.request.Request(
             self.config.slack_webhook_url, data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 (config URL)
+            resp.read()
+
+    def _discord(self, text: str) -> None:
+        # Discord incoming webhook: {"content": "..."} (max 2000 chars). One-way push, no bot
+        # token / gateway needed.
+        payload = json.dumps({"content": text[:1990]}).encode("utf-8")
+        req = urllib.request.Request(
+            self.config.discord_webhook_url, data=payload,
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 (config URL)
@@ -89,6 +115,7 @@ def alerter_from_settings(settings) -> Alerter:
     return Alerter(
         AlertConfig(
             slack_webhook_url=settings.alert_slack_webhook,
+            discord_webhook_url=settings.alert_discord_webhook,
             smtp_host=settings.smtp_host,
             smtp_port=settings.smtp_port,
             smtp_user=settings.smtp_user,

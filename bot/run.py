@@ -132,6 +132,10 @@ class TradingBot:
         if self.risk.halted:
             self.alerter.notify("critical", "started with kill switch HALTED", "rehydrated from prior session")
         self._write_heartbeat(account.equity)  # liveness from the first moment
+        self.alerter.activity(
+            f"🤖 Bot online — paper={settings.paper}, strategy={settings.strategy}, "
+            f"equity=${account.equity:,.0f}, halted={self.risk.halted}"
+        )
 
     def step(self) -> None:
         # Liveness first, so the heartbeat stays fresh even on the early returns below
@@ -373,6 +377,13 @@ class TradingBot:
             self.ledger.mark_submitted(coid, str(order.id))
         filled, status = self._await_fill(coid)
         self.log.info("%s: BUY %s/%s filled (coid=%s)", symbol, filled, qty, coid)
+        # Trade-activity feed (Discord/Slack). Best-effort; never raises (see Alerter.activity).
+        if filled > 0:
+            self.alerter.activity(f"🟢 BOUGHT {filled:g} {symbol} @ ~${price:.2f}  (~${filled * price:,.0f})")
+        elif status in (None, *_TERMINAL_UNFILLED):
+            self.alerter.activity(f"⚠️ {symbol} BUY {status or 'no order'} — not filled")
+        else:
+            self.alerter.activity(f"🟢 BUY {qty:g} {symbol} submitted @ ~${price:.2f} — awaiting fill")
         # Count committed notional for the exposure gate. A working/resting limit or any
         # (partial) fill counts (conservative). But an order that reached a terminal state
         # with ZERO fill (rejected/canceled/expired) — or that the broker has no record of —
@@ -387,6 +398,12 @@ class TradingBot:
         prior exit for this bar terminated UNFILLED (rejected/canceled/expired), retry with a
         fresh coid so a wanted liquidation isn't abandoned for the rest of the day; the
         caller's held>0 gate stops a double-sell once one attempt fills."""
+        # Snapshot the position BEFORE closing — its unrealized P&L is what we realize by
+        # selling at market — so the activity feed can report the trade's profit/loss.
+        try:
+            pos = self.broker.get_position(symbol)
+        except Exception:
+            pos = None
         coid, retry = self._retry_coid(symbol, "sell", bar_ts)
         with self._lock:
             if not retry and self.ledger.already_submitted(coid):
@@ -396,6 +413,18 @@ class TradingBot:
             self.ledger.mark_submitted(coid, str(order.id))
         self._await_fill(coid)
         self.log.info("%s: EXIT sell qty=%s (coid=%s)", symbol, held, coid)
+        self.alerter.activity(self._sell_activity(symbol, held, pos))
+
+    @staticmethod
+    def _sell_activity(symbol, qty, pos) -> str:
+        """Format a SELL trade-activity line with realized P&L from the pre-close position."""
+        try:
+            pl = float(pos.unrealized_pl)
+            plpc = float(pos.unrealized_plpc) * 100
+            emoji = "🟢" if pl >= 0 else "🔴"
+            return f"{emoji} SOLD {qty:g} {symbol} @ market — P&L {pl:+,.2f} ({plpc:+.2f}%)"
+        except Exception:
+            return f"🔴 SOLD {qty:g} {symbol} @ market"
 
     def _await_fill(self, coid: str, tries: int = 4, pause: float = 1.0) -> tuple[float, str | None]:
         """Poll the order to terminal state, recording fills. Returns (filled qty, last status)

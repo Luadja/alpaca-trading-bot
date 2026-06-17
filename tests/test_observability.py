@@ -28,9 +28,53 @@ def test_heartbeat_age():
 def test_alerting_enabled_and_noop():
     assert not Alerter().enabled
     assert Alerter(AlertConfig(slack_webhook_url="https://hooks.example/x")).enabled
+    assert Alerter(AlertConfig(discord_webhook_url="https://discord.test/wh")).enabled
     assert Alerter(AlertConfig(smtp_host="h", email_to="a@b.com")).enabled
     Alerter().notify("critical", "x", "y")  # unconfigured -> log-only, must not raise
+    Alerter().activity("nothing configured")  # must not raise
     assert format_alert("critical", "x", "y") == "[CRITICAL] x — y"
+
+
+def _fake_urlopen(sent):
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b""
+
+    def fake(req, timeout=None):
+        sent.append((req.full_url, req.data))
+        return _Resp()
+    return fake
+
+
+def test_discord_activity_and_alert_routing(monkeypatch):
+    sent = []
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen(sent))
+    a = Alerter(AlertConfig(discord_webhook_url="https://discord.test/wh"))
+    a.activity("🟢 BOUGHT 84 XLY @ ~$117.98")
+    a.notify("critical", "kill switch", "daily -3%")
+    assert len(sent) == 2  # both the activity feed and the alert hit the Discord webhook
+    body = json.loads(sent[0][1])
+    assert "content" in body and "BOUGHT" in body["content"]  # Discord uses {"content": ...}
+
+
+def test_activity_goes_to_webhooks_not_email(monkeypatch):
+    # Per-trade email would be spam: activity() must NOT send email even when SMTP is configured.
+    calls = {"email": 0, "discord": 0}
+    monkeypatch.setattr(Alerter, "_email", lambda self, s, b: calls.__setitem__("email", calls["email"] + 1))
+    monkeypatch.setattr(Alerter, "_discord", lambda self, t: calls.__setitem__("discord", calls["discord"] + 1))
+    a = Alerter(AlertConfig(discord_webhook_url="https://d/x", smtp_host="h", email_to="a@b.com"))
+    a.activity("🔴 SOLD 84 XLY — P&L +12.34 (+0.12%)")
+    assert calls == {"email": 0, "discord": 1}
+
+
+def test_alerter_never_raises_on_transport_failure(monkeypatch):
+    def boom(req, timeout=None):
+        raise RuntimeError("network down")
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    a = Alerter(AlertConfig(discord_webhook_url="https://discord.test/wh"))
+    a.activity("x")            # transport failure must be swallowed
+    a.notify("critical", "y")  # ditto — must never break the trade path
 
 
 class _Broker:

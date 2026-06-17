@@ -79,8 +79,10 @@ class Settings(BaseSettings):
     ledger_path: str = Field(default="data/ledger.sqlite", validation_alias="BOT_LEDGER_PATH")
     heartbeat_path: str = Field(default="data/heartbeat.json", validation_alias="BOT_HEARTBEAT_PATH")
 
-    # Alerting (all optional — unset = log-only). Slack incoming webhook and/or SMTP email.
+    # Alerting (all optional — unset = log-only). Slack/Discord incoming webhooks and/or SMTP.
     alert_slack_webhook: str = Field(default="", validation_alias="ALERT_SLACK_WEBHOOK")
+    # Discord incoming webhook for the trade-activity feed (buy/sell/P&L) + safety alerts.
+    alert_discord_webhook: str = Field(default="", validation_alias="ALERT_DISCORD_WEBHOOK")
     alert_email_to: str = Field(default="", validation_alias="ALERT_EMAIL_TO")
     smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
     smtp_port: int = Field(default=587, validation_alias="SMTP_PORT")
