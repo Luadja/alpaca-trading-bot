@@ -13,8 +13,9 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
-# Data / state (local caches and the live ledger)
+# Data / state (local caches, the live ledger, and the liveness heartbeat)
 data/cache/
+data/heartbeat.json
 *.parquet
 *.sqlite
 *.db
