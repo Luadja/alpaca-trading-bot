@@ -90,6 +90,14 @@ class TradingBot:
         self.log = setup_logging()
         self._heartbeat_failures = 0  # consecutive write failures, for escalation
         self._untradeable_warned: set = set()  # symbols we've alerted as sizing-to-zero (dedup)
+        # Stamp a FRESH heartbeat before any (slow) network setup below, so a co-launched
+        # watchdog never reads a prior-session leftover heartbeat and flattens a healthy
+        # account during our startup. Best-effort: must never block startup.
+        try:
+            write_heartbeat(settings.heartbeat_path,
+                            {"halted": False, "strategy": settings.strategy, "status": "starting"})
+        except Exception:
+            self.log.exception("initial heartbeat write failed")
         # Serializes the kill-switch / risk-state / order-submit critical sections so the
         # fast safety_poll thread can't flatten between an entry's gate-check and its submit.
         self._lock = threading.RLock()
@@ -221,6 +229,10 @@ class TradingBot:
             if status == "filled" or filled >= float(p.qty):
                 flat.add(p.symbol)
                 positions[p.symbol] = 0.0
+            elif status in ("halted", "working"):
+                # Benign defer, NOT a failed flatten: 'halted' = the kill switch owns the
+                # liquidation; 'working' = a prior stop SELL is still resting. No alert.
+                self.log.info("%s: catastrophic flatten deferred (%s)", p.symbol, status)
             else:
                 self.log.error(
                     "%s: catastrophic flatten INCOMPLETE (status=%s filled=%s) — still exposed",
@@ -243,12 +255,6 @@ class TradingBot:
         longer 'working'. Does NOT hold self._lock across the network submit (the Ledger
         serializes its own writes); holding it here would starve the fast safety poll during a
         multi-symbol crash."""
-        # If the kill switch has tripped, safety_poll's flatten_all() owns the liquidation (it
-        # cancels open orders AND closes every position); submitting our own SELL alongside it
-        # could double-sell the same long into a short. Defer to it.
-        with self._lock:
-            if self.risk.halted:
-                return 0.0, "halted"
         try:
             working = sum(
                 float(o.qty or 0) for o in self.broker.open_orders()
@@ -270,7 +276,15 @@ class TradingBot:
             )
             return 0.0, "working"
         coid = f"bot-catstop-{symbol}-{time.time_ns()}"
-        self.ledger.record_intent(coid, symbol, "sell", remaining, "catastrophic stop")
+        # Re-check the kill switch as LATE as possible (atomically with recording intent) and
+        # release before the network submit: if it tripped, safety_poll's flatten_all() owns the
+        # liquidation (it cancels open orders AND closes every position), so defer rather than
+        # submit a competing SELL that could oversell into a short. Not held across submit_market
+        # (whose retry/backoff could sleep) so the fast safety poll is never starved.
+        with self._lock:
+            if self.risk.halted:
+                return 0.0, "halted"
+            self.ledger.record_intent(coid, symbol, "sell", remaining, "catastrophic stop")
         order = self.broker.submit_market(symbol, remaining, OrderSide.SELL, client_order_id=coid)
         self.ledger.mark_submitted(coid, str(order.id))
         return self._await_fill(coid)

@@ -106,13 +106,26 @@ def test_watchdog_flattens_after_grace_elapses(tmp_path):
     assert fired is True and broker.flattened == 1
 
 
-def test_watchdog_existing_stale_heartbeat_ignores_grace(tmp_path):
-    # An EXISTING but old heartbeat is a real crash; the grace must not protect it.
+def test_watchdog_leftover_heartbeat_within_grace_no_flatten(tmp_path):
+    # A heartbeat OLDER than the watchdog's own uptime is a prior-session leftover (the file
+    # persists on disk), not the bot we just launched. Within the grace it must NOT flatten,
+    # else a normal morning restart liquidates carried positions before the bot's first write.
     p = str(tmp_path / "hb.json")
-    _write_stale(p)
+    _write_stale(p)  # ~1h old
+    broker = _Broker(is_open=True, leftover={"AAPL": 5})
+    fired = check_once(broker, _Alerter(), p, 180, LOG,
+                       already_fired=False, startup_grace=9999.0, elapsed=1.0)  # age >> elapsed
+    assert fired is False and broker.flattened == 0
+
+
+def test_watchdog_existing_stale_heartbeat_flattens_when_from_this_session(tmp_path):
+    # A heartbeat YOUNGER than the watchdog's uptime was written this session, then went stale
+    # -> a genuine crash; flatten even inside the grace window.
+    p = str(tmp_path / "hb.json")
+    _write_stale(p)  # ~1h old (3600s)
     broker = _Broker(is_open=True)
     fired = check_once(broker, _Alerter(), p, 180, LOG,
-                       already_fired=False, startup_grace=9999.0, elapsed=1.0)
+                       already_fired=False, startup_grace=9999.0, elapsed=5000.0)  # age < elapsed
     assert fired is True and broker.flattened == 1
 
 

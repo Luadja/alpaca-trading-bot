@@ -70,14 +70,20 @@ def check_once(broker, alerter, heartbeat_path: str, max_age: float, log, *, alr
 
     hb = read_heartbeat(heartbeat_path)
     age = heartbeat_age_seconds(hb) if hb else None
+    in_grace = elapsed is not None and elapsed <= startup_grace
     if hb is None:
         # Within the cold-start grace, a missing heartbeat is the bot still starting up, not a
         # dead bot — do NOT flatten yet. After the grace, a missing heartbeat is genuinely stale.
-        in_grace = elapsed is not None and elapsed <= startup_grace
         if in_grace:
             return already_fired
         stale = True
     else:
+        # data/heartbeat.json persists between runs, so at cold start the file we read may be a
+        # PRIOR-SESSION leftover, not this bot. A heartbeat OLDER than the watchdog's own uptime
+        # cannot belong to the bot we just started (it writes within the grace), so within the
+        # grace treat it as not-yet-stale. After the grace, a still-old heartbeat is a real crash.
+        if in_grace and age is not None and age > elapsed:
+            return already_fired
         # Existing heartbeat: stale if unusable, too old, OR implausibly in the future (skew).
         stale = age is None or age > max_age or age < -max_age
 

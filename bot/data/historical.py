@@ -4,8 +4,9 @@ Returns a tidy single-symbol DataFrame indexed by timestamp with lowercase
 open/high/low/close/volume columns — the shape every strategy expects.
 
 Free-tier note: on the Basic plan you can pull full-market (SIP) history as long
-as the query window ends >= 15 minutes ago. The default IEX feed is real-time but
-covers only ~3% of volume; for accurate historical bars prefer feed="delayed_sip".
+as the query window ends >= 15 minutes ago (the 16-min end clamp below guarantees
+this). The IEX feed is real-time but covers only ~3% of volume; for accurate
+historical bars prefer feed="sip". NB: "delayed_sip" is rejected by the bars endpoint.
 """
 
 from __future__ import annotations
@@ -73,11 +74,9 @@ def parse_timeframe(text: str) -> TimeFrame:
 
 
 def _feed(name: str) -> DataFeed:
-    return {
-        "iex": DataFeed.IEX,
-        "sip": DataFeed.SIP,
-        "delayed_sip": DataFeed.DELAYED_SIP,
-    }.get(name.lower(), DataFeed.IEX)
+    # Only iex/sip are valid for the bars endpoint (the config validator enforces this);
+    # 'delayed_sip' is rejected by the API, so it is intentionally not mapped here.
+    return {"iex": DataFeed.IEX, "sip": DataFeed.SIP}.get(name.lower(), DataFeed.IEX)
 
 
 class HistoricalData:

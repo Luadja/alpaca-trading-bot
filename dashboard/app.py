@@ -67,8 +67,9 @@ def positions_df() -> pd.DataFrame:
 def bars(symbol: str, lookback: int) -> pd.DataFrame:
     tf = parse_timeframe(settings.timeframe)
     # Use the bot's configured feed so the dashboard's SMAs/signals match what the bot trades.
-    # Fall back to delayed_sip (free, full-market) over thin IEX, then IEX as a last resort.
-    fallbacks = ["delayed_sip", "iex"]
+    # Fall back to sip (free, full-market for >15min-old bars) then IEX. NB: delayed_sip is
+    # rejected by the bars endpoint, so it's not a fallback.
+    fallbacks = ["sip", "iex"]
     feeds = [settings.feed] + [f for f in fallbacks if f != settings.feed]
     last_exc: Exception | None = None
     for feed in feeds:
