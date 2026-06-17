@@ -68,6 +68,12 @@ def _avg_price(order) -> float | None:
     return value if value > 0 else None
 
 
+def _order_side(order) -> str:
+    """Lower-cased order side ('buy'/'sell'), tolerating enum or raw string."""
+    side = order.side
+    return (side.value if hasattr(side, "value") else str(side)).lower()
+
+
 class TradingBot:
     # Consecutive heartbeat-write failures at which we escalate warning -> critical: a
     # persistent failure means the watchdog's dead-man's-switch will soon flatten on a stale
@@ -135,12 +141,15 @@ class TradingBot:
             return
 
         # Catastrophic stop: flatten any managed position past the hard stop, before signals.
-        stopped = self._enforce_stops(positions_raw, positions)
+        # skip = don't act further on these this cycle; flat = CONFIRMED flattened (fill landed).
+        skip, flat = self._enforce_stops(positions_raw, positions)
 
         # Per-symbol market value; tally exposure as we place orders so the exposure gate
-        # bounds TOTAL exposure across same-cycle entries (exit frees the seeded value).
+        # bounds TOTAL exposure across same-cycle entries (exit frees the seeded value). A
+        # stop that did NOT confirm flat stays in the tally (it's still real exposure).
         position_mv = {
-            p.symbol: abs(float(p.market_value)) for p in positions_raw if p.symbol not in stopped
+            p.symbol: (abs(float(p.market_value)) if p.market_value else 0.0)
+            for p in positions_raw if p.symbol not in flat
         }
         running_exposure = sum(position_mv.values())
 
@@ -151,8 +160,8 @@ class TradingBot:
                           self.settings.market_regime_symbol, self.settings.market_regime_sma)
 
         for symbol in self.settings.symbols:
-            if symbol in stopped:
-                continue  # just flattened on the stop — don't re-act this cycle
+            if symbol in skip:
+                continue  # stop fired (or a stop SELL is working) — don't re-act this cycle
             try:
                 running_exposure = self._evaluate_symbol(
                     symbol, account.equity, positions, running_exposure, regime_ok, position_mv
@@ -163,38 +172,79 @@ class TradingBot:
 
         self._write_heartbeat(account.equity)
 
-    def _enforce_stops(self, positions_raw, positions: dict) -> set:
+    def _enforce_stops(self, positions_raw, positions: dict) -> tuple[set, set]:
         """Hard catastrophic stop on managed positions, using the broker's own entry and
-        current prices. Returns the set of symbols flattened this cycle."""
-        stopped: set = set()
+        current prices. Returns (skip, flat): ``skip`` = symbols not to act on further this
+        cycle (a stop fired or a stop SELL is already working); ``flat`` = symbols CONFIRMED
+        flattened (their fill landed). A stop that did NOT fill is in ``skip`` but NOT ``flat``,
+        so it stays in the exposure tally and is re-attempted next cycle — a failed safety
+        flatten must never look like a success."""
+        skip: set = set()
+        flat: set = set()
         managed = set(self.settings.symbols)
         for p in positions_raw:
             if p.symbol not in managed or float(p.qty) <= 0:
                 continue
-            entry, price = float(p.avg_entry_price), float(p.current_price)
-            if self.risk.should_stop_out(entry, price):
-                pct = (price / entry - 1) * 100 if entry else 0.0
-                self.log.warning(
-                    "%s: CATASTROPHIC STOP (entry %.2f, price %.2f, %.1f%%) — flattening",
-                    p.symbol, entry, price, pct,
-                )
-                self.alerter.notify("warning", f"catastrophic stop: {p.symbol}", f"{pct:.1f}% from entry")
-                self._flatten_catastrophic(p.symbol, float(p.qty))
-                stopped.add(p.symbol)
+            # current_price / avg_entry_price are Optional[str]; a freshly-halted name can
+            # report None (-> float(None) would crash the whole cycle) or 0 (-> false stop).
+            entry = float(p.avg_entry_price) if p.avg_entry_price else 0.0
+            price = float(p.current_price) if p.current_price else 0.0
+            if price <= 0:
+                continue  # no valid mark — can't judge the stop; re-check next cycle
+            if not self.risk.should_stop_out(entry, price):
+                continue
+            pct = (price / entry - 1) * 100 if entry else 0.0
+            self.log.warning(
+                "%s: CATASTROPHIC STOP (entry %.2f, price %.2f, %.1f%%) — flattening",
+                p.symbol, entry, price, pct,
+            )
+            self.alerter.notify("warning", f"catastrophic stop: {p.symbol}", f"{pct:.1f}% from entry")
+            filled, status = self._flatten_catastrophic(p.symbol, float(p.qty))
+            skip.add(p.symbol)  # don't let the rest of the cycle trade a name we're flattening
+            if status == "filled" or filled >= float(p.qty):
+                flat.add(p.symbol)
                 positions[p.symbol] = 0.0
-        return stopped
+            else:
+                self.log.error(
+                    "%s: catastrophic flatten INCOMPLETE (status=%s filled=%s) — still exposed",
+                    p.symbol, status, filled,
+                )
+                self.alerter.notify(
+                    "critical", f"catastrophic flatten incomplete: {p.symbol}",
+                    f"status={status} filled={filled} — position still open past the hard stop",
+                )
+        return skip, flat
 
-    def _flatten_catastrophic(self, symbol: str, qty: float) -> None:
-        """Flatten a position that breached the HARD stop, through the ledger (audit trail +
-        fill verification + crash-recovery), exactly like a normal exit. Uses a UNIQUE coid
-        each fire and is NOT gated by already_submitted: safety must always flatten, even if a
-        prior stop order for this symbol was rejected, so it must never dedupe itself away."""
+    def _flatten_catastrophic(self, symbol: str, qty: float) -> tuple[float, str | None]:
+        """Flatten a position past the HARD stop, through the ledger (audit + fill verify +
+        crash recovery). Returns (filled, status).
+
+        NEVER stacks duplicate SELLs: if a non-terminal SELL already covers the outstanding
+        long, let it work — a unique-coid resend each cycle (while the prior stop rests during
+        an LULD halt) would oversell a crashing long into a SHORT, breaking long-only. It still
+        resends after a genuinely REJECTED stop, since a rejected order is terminal and no
+        longer 'working'. Does NOT hold self._lock across the network submit (the Ledger
+        serializes its own writes); holding it here would starve the fast safety poll during a
+        multi-symbol crash."""
+        try:
+            working = sum(
+                float(o.qty or 0) for o in self.broker.open_orders()
+                if o.symbol == symbol and _order_side(o) == "sell"
+            )
+        except Exception:
+            working = 0.0  # can't read open orders -> fall through and submit (fail-safe)
+        if working >= qty:
+            self.log.warning(
+                "%s: catastrophic SELL already working (%.0f sh resting) — not restacking",
+                symbol, working,
+            )
+            return 0.0, "working"
+        remaining = qty - working
         coid = f"bot-catstop-{symbol}-{time.time_ns()}"
-        with self._lock:
-            self.ledger.record_intent(coid, symbol, "sell", qty, "catastrophic stop")
-            order = self.broker.submit_market(symbol, qty, OrderSide.SELL, client_order_id=coid)
-            self.ledger.mark_submitted(coid, str(order.id))
-        self._await_fill(coid)
+        self.ledger.record_intent(coid, symbol, "sell", remaining, "catastrophic stop")
+        order = self.broker.submit_market(symbol, remaining, OrderSide.SELL, client_order_id=coid)
+        self.ledger.mark_submitted(coid, str(order.id))
+        return self._await_fill(coid)
 
     def _evaluate_symbol(self, symbol, equity, positions, running_exposure, regime_ok=True,
                          position_mv=None) -> float:

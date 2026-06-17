@@ -22,6 +22,38 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from bot.config import Settings
 
+try:
+    from zoneinfo import ZoneInfo
+
+    _ET = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - falls back if tzdata is missing
+    _ET = None
+
+# Timeframes whose final bar is "still forming" intraday (a day/week/month is not closed
+# until its session ends). Intraday bars are excluded by the 16-min end clamp instead.
+_PERIOD_UNITS = (TimeFrameUnit.Day, TimeFrameUnit.Week, TimeFrameUnit.Month)
+
+
+def _drop_unclosed_period(df: pd.DataFrame, timeframe: TimeFrame) -> pd.DataFrame:
+    """Drop the trailing bar if its period has not closed yet.
+
+    On a daily timeframe, polling intraday returns TODAY's partial bar; computing the 50/200
+    cross, the regime gate, or the entry price on it reads a half-formed close (an intraday
+    spike that reverses by the close would fire a phantom signal). The live loop runs only
+    during market hours, so the current period's bar is always incomplete when we fetch."""
+    unit = getattr(timeframe, "unit", None)
+    if df.empty or unit not in _PERIOD_UNITS:
+        return df
+    today = (datetime.now(_ET) if _ET else datetime.now(timezone.utc)).date()
+    bar_date = df.index[-1].date()  # daily bars are stamped ~04:00-05:00 UTC => same calendar date
+    if unit is TimeFrameUnit.Day:
+        unclosed = bar_date >= today
+    elif unit is TimeFrameUnit.Week:
+        unclosed = bar_date.isocalendar()[:2] >= today.isocalendar()[:2]
+    else:  # Month
+        unclosed = (bar_date.year, bar_date.month) >= (today.year, today.month)
+    return df.iloc[:-1] if unclosed else df
+
 _UNIT_MAP = {
     "min": TimeFrameUnit.Minute,
     "hour": TimeFrameUnit.Hour,
@@ -100,6 +132,8 @@ class HistoricalData:
         if isinstance(df.index, pd.MultiIndex):
             df = df.xs(symbol, level="symbol")
         df = df[["open", "high", "low", "close", "volume"]].sort_index()
+        # Never expose the current, still-forming period's bar (look-ahead / live divergence).
+        df = _drop_unclosed_period(df, timeframe)
 
         if use_cache:
             df.to_parquet(cache_file)

@@ -146,3 +146,11 @@ def test_catastrophic_stop_triggers_below_threshold():
     assert not rm.should_stop_out(entry_price=100, current_price=95)  # -5% -> hold
     assert not rm.should_stop_out(entry_price=100, current_price=120)  # winner
     assert not rm.should_stop_out(entry_price=0, current_price=50)  # no entry price -> no stop
+
+
+def test_catastrophic_stop_ignores_invalid_current_price():
+    # A freshly-halted symbol can report current_price None/0; that must NOT trip the stop
+    # (0 <= entry*0.9 is trivially true and would false-flatten a healthy position).
+    rm = RiskManager(RiskConfig(catastrophic_stop_pct=0.10), 100_000)
+    assert not rm.should_stop_out(entry_price=100, current_price=0)
+    assert not rm.should_stop_out(entry_price=100, current_price=-5)

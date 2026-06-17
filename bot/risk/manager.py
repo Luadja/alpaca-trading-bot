@@ -188,8 +188,8 @@ class RiskManager:
     def should_stop_out(self, entry_price: float, current_price: float) -> bool:
         """Hard catastrophic stop (disaster insurance, distinct from the sizing stop and
         the strategy's own exit): True once price falls catastrophic_stop_pct below entry."""
-        if entry_price <= 0:
-            return False
+        if entry_price <= 0 or current_price <= 0:
+            return False  # no valid mark (e.g. a freshly-halted symbol) -> don't false-trip
         return current_price <= entry_price * (1.0 - self.config.catastrophic_stop_pct)
 
     def evaluate_entry(
