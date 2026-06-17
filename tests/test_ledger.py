@@ -37,3 +37,23 @@ def test_fill_pending_and_state(tmp_path):
     assert led.get_state("risk") == '{"a": 2}'
 
     led.close()
+
+
+def test_order_state_distinguishes_unfilled_terminal_from_filled(tmp_path):
+    # Foundation for the terminal-zero-fill retry: order_state must expose status + filled_qty
+    # so a rejected (0-fill) attempt can be retried while a filled one is left alone.
+    led = Ledger(str(tmp_path / "ledger.sqlite"))
+    assert led.order_state("nope") is None  # unknown coid
+
+    led.record_intent("rej", "AAPL", "sell", 10, "exit")
+    led.mark_submitted("rej", "b1")
+    led.record_fill("rej", 0, None, "rejected")
+    st = led.order_state("rej")
+    assert st["status"] == "rejected" and st["filled_qty"] == 0
+
+    led.record_intent("ok", "AAPL", "sell", 10, "exit")
+    led.record_fill("ok", 10, 150.0, "filled")
+    st = led.order_state("ok")
+    assert st["status"] == "filled" and st["filled_qty"] == 10
+
+    led.close()

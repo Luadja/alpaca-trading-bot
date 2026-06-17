@@ -74,6 +74,11 @@ def _order_side(order) -> str:
     return (side.value if hasattr(side, "value") else str(side)).lower()
 
 
+# Terminal states in which an order filled ZERO shares — the logical decision was NOT carried
+# out, so (unlike a 'filled' terminal) it is eligible for a fresh-coid retry while still wanted.
+_TERMINAL_UNFILLED = ("rejected", "canceled", "expired", "done_for_day")
+
+
 class TradingBot:
     # Consecutive heartbeat-write failures at which we escalate warning -> critical: a
     # persistent failure means the watchdog's dead-man's-switch will soon flatten on a stale
@@ -101,6 +106,13 @@ class TradingBot:
 
         account = self.broker.account()
         self.risk = self._init_risk(account.equity)  # rehydrates kill-switch state if persisted
+        # If we baselined the daily-loss anchor while the market was CLOSED (pre-market /
+        # weekend restart), it's measured from a stale equity, not the session open. Re-anchor
+        # at the first open-market read (see _reanchor_if_pending).
+        try:
+            self._anchor_needs_reopen = not self.broker.is_market_open()
+        except Exception:
+            self._anchor_needs_reopen = False
         self._reconcile_pending()  # resolve any orders left dangling by a prior crash
         self.log.info(
             "Started. equity=%.2f paper=%s strategy=%s halted=%s",
@@ -121,6 +133,7 @@ class TradingBot:
 
         account = self.broker.account()
         self._maybe_roll_day(account.equity)
+        self._reanchor_if_pending(account.equity)  # fix a pre-market-start daily anchor
         self._reconcile_pending()  # promptly resolve any slow/dangling fills
 
         positions_raw = self.broker.list_positions()
@@ -164,7 +177,8 @@ class TradingBot:
                 continue  # stop fired (or a stop SELL is working) — don't re-act this cycle
             try:
                 running_exposure = self._evaluate_symbol(
-                    symbol, account.equity, positions, running_exposure, regime_ok, position_mv
+                    symbol, account.equity, positions, running_exposure, regime_ok,
+                    position_mv, account.buying_power,
                 )
             except Exception as exc:  # one bad symbol shouldn't take down the loop
                 self.log.exception("error evaluating %s", symbol)
@@ -247,7 +261,7 @@ class TradingBot:
         return self._await_fill(coid)
 
     def _evaluate_symbol(self, symbol, equity, positions, running_exposure, regime_ok=True,
-                         position_mv=None) -> float:
+                         position_mv=None, buying_power=None) -> float:
         # ~550 daily bars: enough that the 200-SMA is valid well before recent crosses
         # (a short window can miss the last golden/death cross). Reduce for sub-daily.
         df = self.data.get_bars(symbol, self.timeframe, lookback_days=800, use_cache=False)
@@ -270,11 +284,23 @@ class TradingBot:
                 self.log.info("%s: entry blocked — market regime down", symbol)
                 return running_exposure
             sigma = float(df["close"].pct_change().std() * self._vol_annualization)  # annualized
-            risk = self.risk.evaluate_entry(equity, decision.price, running_exposure, sigma=sigma)
+            # Size + gate on a LIVE price, not decision.price (the PRIOR session's close on a
+            # daily timeframe), so the per-position / total-exposure caps match what the order
+            # actually fills at. Fall back to the bar close only when no live price is available.
+            ref = self.data.latest_price(symbol) if self.settings.use_marketable_limit else None
+            price = ref if ref else decision.price
+            risk = self.risk.evaluate_entry(equity, price, running_exposure, sigma=sigma)
             if not risk.approved:
                 self.log.info("%s: entry blocked — %s", symbol, risk.reason)
                 return running_exposure
-            running_exposure += self._enter(symbol, risk.qty, decision, bar_ts)
+            # Hard buying-power backstop (the exposure cap is vs equity; a cash account's BP
+            # can be lower once mostly invested).
+            order_value = risk.qty * price
+            if buying_power is not None and order_value > buying_power:
+                self.log.warning("%s: entry blocked — order %.0f exceeds buying power %.0f",
+                                  symbol, order_value, buying_power)
+                return running_exposure
+            running_exposure += self._enter(symbol, risk.qty, decision, bar_ts, ref, price)
 
         elif decision.signal is SignalType.EXIT_LONG and held > 0:
             self._exit(symbol, held, decision, bar_ts)
@@ -284,21 +310,20 @@ class TradingBot:
 
         return running_exposure
 
-    def _enter(self, symbol, qty, decision: SignalDecision, bar_ts) -> float:
-        """Submit a buy, verify the fill, and return the COMMITTED notional for the exposure
-        gate (qty*price — counts even if a marketable limit rests unfilled, so same-cycle
-        entries can't over-allocate). The gate re-check + submit are atomic under the lock so
-        a concurrent kill-switch flatten can't interleave; the fill poll runs outside it."""
-        coid = self._coid(symbol, "buy", bar_ts)
+    def _enter(self, symbol, qty, decision: SignalDecision, bar_ts, ref, price) -> float:
+        """Submit a buy, verify the fill, and return the COMMITTED notional (qty*price, with
+        price the LIVE price used for sizing) for the exposure gate — counts even if a
+        marketable limit rests unfilled, so same-cycle entries can't over-allocate. The gate
+        re-check + submit are atomic under the lock so a concurrent kill-switch flatten can't
+        interleave; the fill poll runs outside it. ``ref`` is the live price to anchor the
+        marketable limit (None -> market order)."""
+        coid, retry = self._retry_coid(symbol, "buy", bar_ts)
         with self._lock:
             if self.risk.halted:
                 return 0.0  # kill switch tripped between the gate check and here
-            if self.ledger.already_submitted(coid):
+            if not retry and self.ledger.already_submitted(coid):
                 return 0.0  # already acted on this exact bar — idempotent
             self.ledger.record_intent(coid, symbol, "buy", qty, decision.reason)
-            # Anchor the marketable limit on a LIVE price (the bar close is stale on a daily
-            # timeframe). No live price -> fall back to a market order (guaranteed fill).
-            ref = self.data.latest_price(symbol) if self.settings.use_marketable_limit else None
             if ref:
                 limit = round(ref * (1 + self.settings.slippage_cap_pct), 2)
                 order = self.broker.submit_limit(symbol, qty, OrderSide.BUY, limit, client_order_id=coid)
@@ -311,16 +336,19 @@ class TradingBot:
         # (partial) fill counts (conservative). But an order that reached a terminal state
         # with ZERO fill (rejected/canceled/expired) — or that the broker has no record of —
         # commits nothing, so don't let a dead order block legitimate same-cycle entries.
-        if filled == 0 and status in (None, "rejected", "canceled", "expired", "done_for_day"):
+        if filled == 0 and status in (None, *_TERMINAL_UNFILLED):
             return 0.0
-        return qty * decision.price
+        return qty * price
 
     def _exit(self, symbol, held, decision: SignalDecision, bar_ts) -> None:
         """Exit via a deterministic-coid SELL (not close_position) so it dedupes and
-        reconciles exactly like an entry — a retried/crashed exit can't double-sell."""
-        coid = self._coid(symbol, "sell", bar_ts)
+        reconciles exactly like an entry — a retried/crashed exit can't double-sell. If a
+        prior exit for this bar terminated UNFILLED (rejected/canceled/expired), retry with a
+        fresh coid so a wanted liquidation isn't abandoned for the rest of the day; the
+        caller's held>0 gate stops a double-sell once one attempt fills."""
+        coid, retry = self._retry_coid(symbol, "sell", bar_ts)
         with self._lock:
-            if self.ledger.already_submitted(coid):
+            if not retry and self.ledger.already_submitted(coid):
                 return  # idempotent: don't sell twice for the same bar
             self.ledger.record_intent(coid, symbol, "sell", held, decision.reason)
             order = self.broker.submit_market(symbol, held, OrderSide.SELL, client_order_id=coid)
@@ -362,6 +390,11 @@ class TradingBot:
             prev = self._session_date
             if today == prev:
                 return  # another thread already rolled this session
+            if equity <= 0:
+                # reset_* raise on equity<=0; a transient bad read must not propagate out of
+                # step() and wedge the loop. Don't advance _session_date — retry next cycle.
+                self.log.error("day roll skipped: non-positive equity %.2f — retrying next cycle", equity)
+                return
             if today.isocalendar()[:2] != prev.isocalendar()[:2]:
                 self.risk.reset_week(equity)
             if (today.year, today.month) != (prev.year, prev.month):
@@ -370,6 +403,21 @@ class TradingBot:
             self._session_date = today
             self._persist_risk()
             self.log.info("New trading day %s — anchors rolled; halted=%s", today, self.risk.halted)
+
+    def _reanchor_if_pending(self, equity: float) -> None:
+        """Re-anchor the day-start equity to the first OPEN-market read when the baseline was
+        captured at a pre-market/weekend process start, so the daily-loss threshold is measured
+        from the session's real starting equity. Touches only the DAY anchor (re-anchoring the
+        week mid-week would discard the week's P&L) and does NOT clear a rehydrated halt latch."""
+        if not self._anchor_needs_reopen or equity <= 0:
+            return
+        with self._lock:
+            if not self._anchor_needs_reopen:
+                return
+            self.risk.day_start_equity = equity
+            self._anchor_needs_reopen = False
+            self._persist_risk()
+        self.log.info("Re-anchored day-start equity to first open-market read %.2f", equity)
 
     def _build_strategy(self):
         """Construct the configured strategy, injecting settings-driven params."""
@@ -467,6 +515,7 @@ class TradingBot:
             # Roll day/week/month anchors first — safety_poll usually fires before step() on a
             # new session, so without this it would measure loss vs the PRIOR period's baseline.
             self._maybe_roll_day(equity)
+            self._reanchor_if_pending(equity)
             with self._lock:
                 halted = self.risk.update(equity)
                 self._persist_risk()
@@ -485,19 +534,24 @@ class TradingBot:
         if equity is not None:
             payload["equity"] = equity
         try:
-            write_heartbeat(self.settings.heartbeat_path, payload)
-            if self._heartbeat_failures:
-                self.log.info("heartbeat write recovered after %d failure(s)", self._heartbeat_failures)
-            self._heartbeat_failures = 0
+            write_heartbeat(self.settings.heartbeat_path, payload)  # IO outside the lock
         except Exception as exc:  # heartbeat write must never break the cycle
-            self._heartbeat_failures += 1
-            self.log.exception("heartbeat write failed (%d consecutive)", self._heartbeat_failures)
+            # Counter is read-modify-written from both the step() and safety_poll() threads, so
+            # guard it under the lock (RLock; += is not atomic) to keep the escalation accurate.
+            with self._lock:
+                self._heartbeat_failures += 1
+                n = self._heartbeat_failures
+            self.log.exception("heartbeat write failed (%d consecutive)", n)
             # First blips are warnings; a persistent failure makes the watchdog flatten on a
             # stale heartbeat, so escalate to critical once it crosses the threshold.
-            sev = "critical" if self._heartbeat_failures >= self._HEARTBEAT_FAIL_ESCALATE else "warning"
-            self.alerter.notify(
-                sev, "heartbeat write failed", f"{self._heartbeat_failures} consecutive: {exc}"
-            )
+            sev = "critical" if n >= self._HEARTBEAT_FAIL_ESCALATE else "warning"
+            self.alerter.notify(sev, "heartbeat write failed", f"{n} consecutive: {exc}")
+        else:
+            with self._lock:
+                recovered = self._heartbeat_failures
+                self._heartbeat_failures = 0
+            if recovered:
+                self.log.info("heartbeat write recovered after %d failure(s)", recovered)
 
     @staticmethod
     def _coid(symbol: str, side: str, bar_ts) -> str:
@@ -505,6 +559,20 @@ class TradingBot:
         of the same logical decision cannot create a duplicate order."""
         digest = hashlib.sha1(f"{symbol}|{side}|{bar_ts}".encode()).hexdigest()[:24]
         return f"bot-{digest}"
+
+    def _retry_coid(self, symbol: str, side: str, bar_ts) -> tuple[str, bool]:
+        """Return (coid, is_retry). Normally the deterministic per-bar coid (idempotent). But
+        on a daily timeframe that coid is stable ALL session, so if a prior attempt for this
+        exact decision TERMINATED UNFILLED (rejected/canceled/expired/done_for_day) it is stuck
+        terminal-and-non-resubmittable and the wanted order would be abandoned for the rest of
+        the day. In that case return a FRESH retry id. Double-execution is prevented by the
+        caller's live-position/signal gate (exit needs held>0, entry needs held==0), so once a
+        retry fills the decision is no longer re-issued."""
+        coid = self._coid(symbol, side, bar_ts)
+        prior = self.ledger.order_state(coid)
+        if prior and prior["status"] in _TERMINAL_UNFILLED and prior["filled_qty"] == 0:
+            return f"{coid}-r{time.time_ns()}", True
+        return coid, False
 
 
 def main() -> None:

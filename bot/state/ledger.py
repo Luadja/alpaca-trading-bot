@@ -97,6 +97,17 @@ class Ledger:
             filled_avg_price=filled_avg_price,
         )
 
+    def order_state(self, client_order_id: str) -> dict | None:
+        """Status + filled qty for a coid (None if unknown) — lets the bot tell a prior
+        terminal-but-UNFILLED attempt (which the deterministic coid would otherwise abandon
+        for the rest of the day) from a live/filled one."""
+        with self._lock, closing(self.conn.cursor()) as cur:
+            cur.execute(
+                "SELECT status, filled_qty FROM orders WHERE client_order_id = ?", (client_order_id,)
+            )
+            row = cur.fetchone()
+        return {"status": row["status"], "filled_qty": float(row["filled_qty"] or 0)} if row else None
+
     def already_submitted(self, client_order_id: str) -> bool:
         """True if an order with this id is/was live (so don't resubmit). False only for a
         fresh id or one in a resubmittable state (intended/missing)."""
