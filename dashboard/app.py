@@ -66,10 +66,17 @@ def positions_df() -> pd.DataFrame:
 @st.cache_data(ttl=300)
 def bars(symbol: str, lookback: int) -> pd.DataFrame:
     tf = parse_timeframe(settings.timeframe)
-    try:
-        return _data().get_bars(symbol, tf, lookback_days=lookback, use_cache=False, feed="sip")
-    except Exception:
-        return _data().get_bars(symbol, tf, lookback_days=lookback, use_cache=False, feed="iex")
+    # Use the bot's configured feed so the dashboard's SMAs/signals match what the bot trades.
+    # Fall back to delayed_sip (free, full-market) over thin IEX, then IEX as a last resort.
+    fallbacks = ["delayed_sip", "iex"]
+    feeds = [settings.feed] + [f for f in fallbacks if f != settings.feed]
+    last_exc: Exception | None = None
+    for feed in feeds:
+        try:
+            return _data().get_bars(symbol, tf, lookback_days=lookback, use_cache=False, feed=feed)
+        except Exception as exc:  # subscription error on a paid-only feed -> try the next
+            last_exc = exc
+    raise last_exc
 
 
 def recent_orders(limit: int = 25) -> pd.DataFrame:

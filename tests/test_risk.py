@@ -148,6 +148,31 @@ def test_catastrophic_stop_triggers_below_threshold():
     assert not rm.should_stop_out(entry_price=0, current_price=50)  # no entry price -> no stop
 
 
+def test_trailing_drawdown_breaker_latches_and_clears():
+    # Isolate the peak-to-trough breaker by setting the calendar loss limits high.
+    rm = RiskManager(
+        RiskConfig(max_drawdown_from_peak_pct=0.20, max_daily_loss_pct=0.99,
+                   max_weekly_loss_pct=0.99, max_monthly_loss_pct=0.99),
+        day_start_equity=100_000,
+    )
+    assert not rm.update(110_000)  # new high-water mark
+    assert not rm.update(95_000)   # -13.6% from peak, under the 20% breaker
+    assert rm.update(85_000)       # -22.7% from peak -> latched
+    assert rm.halted and "drawdown" in rm.halt_reason(85_000)
+    assert not rm.update(120_000)  # a new high clears the drawdown latch
+    assert not rm.halted
+
+
+def test_trailing_drawdown_off_when_zero():
+    rm = RiskManager(
+        RiskConfig(max_daily_loss_pct=0.99, max_weekly_loss_pct=0.99, max_monthly_loss_pct=0.99),
+        day_start_equity=100_000,
+    )  # max_drawdown_from_peak_pct defaults to 0 -> breaker disabled
+    rm.update(110_000)
+    assert not rm.update(70_000)  # -36% from peak, but the breaker is off
+    assert not rm.halted
+
+
 def test_catastrophic_stop_ignores_invalid_current_price():
     # A freshly-halted symbol can report current_price None/0; that must NOT trip the stop
     # (0 <= entry*0.9 is trivially true and would false-flatten a healthy position).

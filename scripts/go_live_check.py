@@ -29,15 +29,24 @@ def evaluate_gates(
     halted: bool,
     heartbeat_age: float | None,
     alerting_enabled: bool,
+    max_heartbeat_age: float = 300.0,
 ) -> list[tuple[str, bool, bool, str]]:
     """Pure gate evaluation. Returns (name, passed, required, detail) per gate."""
+    hb_fresh = heartbeat_age is not None and heartbeat_age <= max_heartbeat_age
+    if heartbeat_age is None:
+        hb_detail = "no heartbeat found"
+    elif hb_fresh:
+        hb_detail = f"heartbeat {heartbeat_age:.0f}s old"
+    else:
+        hb_detail = f"STALE {heartbeat_age:.0f}s (> {max_heartbeat_age:.0f}s) — bot not running"
     return [
         ("strategy is validated", strategy in VALIDATED_STRATEGIES, True, strategy),
         ("paper track record", filled_orders >= min_trades, True,
          f"{filled_orders}/{min_trades} filled paper orders"),
         ("kill switch not latched", not halted, True, "HALTED" if halted else "ok"),
-        ("bot has actually run", heartbeat_age is not None, True,
-         "no heartbeat found" if heartbeat_age is None else f"heartbeat {heartbeat_age:.0f}s old"),
+        # A stale heartbeat (a since-crashed bot, or a leftover file from an old run) must NOT
+        # pass as "the bot has run" — require freshness, not just presence.
+        ("bot is running (fresh heartbeat)", hb_fresh, True, hb_detail),
         ("alerting configured", alerting_enabled, False,
          "configured" if alerting_enabled else "log-only - set ALERT_SLACK_WEBHOOK or SMTP_*"),
     ]
@@ -57,12 +66,17 @@ def _halted_from_state(ledger: Ledger) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Go-live readiness gate")
     ap.add_argument("--min-trades", type=int, default=20, help="min filled paper orders required")
+    ap.add_argument("--max-heartbeat-age", type=float, default=300.0,
+                    help="max heartbeat age (s) to count as 'bot running'")
     args = ap.parse_args()
 
     settings = load_settings()
     ledger = Ledger(settings.ledger_path)
     counts = ledger.status_counts()
-    filled = counts.get("filled", 0) + counts.get("partially_filled", 0)
+    # Count only COMPLETED fills toward the track record; a partial fill did not complete at
+    # its intended size, so it must not inflate the readiness bar.
+    filled = counts.get("filled", 0)
+    partial = counts.get("partially_filled", 0)
     halted = _halted_from_state(ledger)
     ledger.close()
 
@@ -76,7 +90,10 @@ def main() -> int:
         halted=halted,
         heartbeat_age=hb_age,
         alerting_enabled=alerter_from_settings(settings).enabled,
+        max_heartbeat_age=args.max_heartbeat_age,
     )
+    if partial:
+        print(f"  (info) {partial} partially-filled order(s) — not counted toward the track record\n")
 
     print(f"Go-live readiness (paper={settings.paper}, strategy={settings.strategy}):\n")
     required_failed = 0

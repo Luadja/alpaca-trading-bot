@@ -22,12 +22,33 @@ from bot.heartbeat import heartbeat_age_seconds, read_heartbeat
 from bot.logging_setup import setup_logging
 
 
-def check_once(broker, alerter, heartbeat_path: str, max_age: float, log, *, already_fired: bool) -> bool:
+def _await_flat(broker, log, timeout: float, poll: float) -> dict:
+    """Poll positions() until flat or timeout. flatten_all() only SUBMITS async closes — the
+    fills land seconds later — so reading positions() immediately would falsely report
+    'positions remain'. Returns the remaining positions (empty dict == confirmed flat); a
+    sentinel non-empty dict if the read fails (treated as not-yet-flat, so the caller retries)."""
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    while True:
+        try:
+            remaining = broker.positions()
+        except Exception:
+            log.exception("watchdog: positions() read failed during flatten confirm")
+            return {"_unread": 0.0}  # can't confirm flat -> don't latch
+        if not remaining or _time.monotonic() >= deadline:
+            return remaining
+        _time.sleep(poll)
+
+
+def check_once(broker, alerter, heartbeat_path: str, max_age: float, log, *, already_fired: bool,
+               confirm_timeout: float = 15.0, confirm_poll: float = 1.0) -> bool:
     """One watchdog check. Returns the new 'already_fired' latch state.
 
     Flattens (once per staleness episode) when the market is open and the heartbeat is
     missing or older than max_age. The latch resets when a fresh heartbeat reappears, and
-    is NOT set unless the account is confirmed flat — so a failed flatten retries next tick.
+    is NOT set unless the account is confirmed flat (after a bounded poll for the async close
+    fills) — so a failed/incomplete flatten retries next tick.
     """
     try:
         market_open = broker.is_market_open()
@@ -58,12 +79,13 @@ def check_once(broker, alerter, heartbeat_path: str, max_age: float, log, *, alr
     alerter.notify("critical", "watchdog: bot heartbeat stale — flattening", f"age={age}s")
     try:
         broker.flatten_all()
-        remaining = broker.positions()
     except Exception:
         log.exception("watchdog flatten failed")
         alerter.notify("critical", "watchdog: FLATTEN FAILED — manual intervention needed", "")
         return False  # do NOT latch — retry on the next tick
 
+    # Confirm flat with a bounded poll (close fills are async) before judging completeness.
+    remaining = _await_flat(broker, log, confirm_timeout, confirm_poll)
     if remaining:
         log.critical("watchdog flatten incomplete — positions remain: %s", list(remaining))
         alerter.notify("critical", "watchdog: flatten incomplete — positions remain", str(list(remaining)))
@@ -96,9 +118,27 @@ def main() -> None:
              args.max_age, args.interval, settings.heartbeat_path)
 
     fired = False
+    overnight_alerted = False
     while True:
         try:
             fired = check_once(broker, alerter, settings.heartbeat_path, args.max_age, log, already_fired=fired)
+            # A bot that died with positions open into/after the close can't be flattened by a
+            # market-closed watchdog (DAY closes won't fill until the next open). Surface it once
+            # so a human can act, instead of silently carrying the position overnight.
+            if not broker.is_market_open():
+                hb = read_heartbeat(settings.heartbeat_path)
+                age = heartbeat_age_seconds(hb) if hb else None
+                stale = hb is None or age is None or age > args.max_age or age < -args.max_age
+                if stale and broker.positions():
+                    if not overnight_alerted:
+                        log.critical("positions held with market CLOSED and heartbeat stale — manual action needed")
+                        alerter.notify("critical", "watchdog: positions held overnight, bot stale",
+                                       "DAY closes cannot flatten until the next open — intervene manually")
+                        overnight_alerted = True
+                else:
+                    overnight_alerted = False
+            else:
+                overnight_alerted = False
         except Exception:
             log.exception("watchdog loop error")
         time.sleep(args.interval)

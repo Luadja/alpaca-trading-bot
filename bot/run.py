@@ -89,6 +89,7 @@ class TradingBot:
         self.settings = settings
         self.log = setup_logging()
         self._heartbeat_failures = 0  # consecutive write failures, for escalation
+        self._untradeable_warned: set = set()  # symbols we've alerted as sizing-to-zero (dedup)
         # Serializes the kill-switch / risk-state / order-submit critical sections so the
         # fast safety_poll thread can't flatten between an entry's gate-check and its submit.
         self._lock = threading.RLock()
@@ -102,6 +103,8 @@ class TradingBot:
         self._risk_config = RiskConfig(
             use_vol_targeting=settings.use_vol_targeting,
             vol_target_pct=settings.vol_target_pct,
+            allow_fractional=settings.allow_fractional,
+            max_drawdown_from_peak_pct=settings.max_drawdown_from_peak_pct,
         )
 
         account = self.broker.account()
@@ -292,6 +295,15 @@ class TradingBot:
             risk = self.risk.evaluate_entry(equity, price, running_exposure, sigma=sigma)
             if not risk.approved:
                 self.log.info("%s: entry blocked — %s", symbol, risk.reason)
+                # "too small" = the position sizes to <1 whole share — a PERMANENT condition on a
+                # small account, not a transient skip. Alert once so it's actionable.
+                if "too small" in risk.reason and symbol not in self._untradeable_warned:
+                    self._untradeable_warned.add(symbol)
+                    self.alerter.notify(
+                        "warning", f"{symbol} untradeable — sizes to <1 share",
+                        f"price={price:.2f} equity={equity:.0f} cap={self._risk_config.max_position_pct:.0%} "
+                        "— fund the account, lower the cap, drop the symbol, or set BOT_ALLOW_FRACTIONAL=true",
+                    )
                 return running_exposure
             # Hard buying-power backstop (the exposure cap is vs equity; a cash account's BP
             # can be lower once mostly invested).
@@ -462,10 +474,13 @@ class TradingBot:
                 s["day_start_equity"],
                 week_start_equity=s["week_start_equity"],
                 month_start_equity=s["month_start_equity"],
-                high_water_mark=s["high_water_mark"],
+                # .get() so an older snapshot (pre high_water_mark / pre-drawdown-latch) doesn't
+                # KeyError and wipe the rehydrated risk state.
+                high_water_mark=s.get("high_water_mark", s["day_start_equity"]),
                 halted_day=s.get("halted_day", legacy),
                 halted_week=s.get("halted_week", legacy),
                 halted_month=s.get("halted_month", legacy),
+                halted_drawdown=s.get("halted_drawdown", False),
             )
             saved_date = date.fromisoformat(s["date"])
             if saved_date.isocalendar()[:2] != self._session_date.isocalendar()[:2]:

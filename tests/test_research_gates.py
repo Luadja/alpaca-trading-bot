@@ -55,6 +55,16 @@ def test_go_live_gates_fail_conditions():
     assert _gate(gates, "strategy is validated")[1] is False
     assert _gate(gates, "paper track record")[1] is False
     assert _gate(gates, "kill switch not latched")[1] is False
-    assert _gate(gates, "bot has actually run")[1] is False
+    assert _gate(gates, "bot is running (fresh heartbeat)")[1] is False
     # alerting is a WARN, not a required gate
     assert _gate(gates, "alerting configured")[2] is False
+
+
+def test_go_live_stale_heartbeat_fails_gate():
+    # A heartbeat that exists but is far older than max -> a since-crashed/leftover bot must
+    # NOT pass the 'bot is running' gate (regression for the no-freshness-check bug).
+    gates = evaluate_gates(
+        strategy="trend_momentum", filled_orders=25, min_trades=20,
+        halted=False, heartbeat_age=99_999.0, alerting_enabled=True, max_heartbeat_age=300.0,
+    )
+    assert _gate(gates, "bot is running (fresh heartbeat)")[1] is False

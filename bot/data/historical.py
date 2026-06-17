@@ -81,19 +81,34 @@ def _feed(name: str) -> DataFeed:
 
 
 class HistoricalData:
+    # A marketable-limit anchor must be a LIVE price. A delayed feed can't provide one, so
+    # anchor on a real-time feed (the configured feed when it's real-time, else free IEX), and
+    # reject a print older than this (e.g. a thin ETF's stale prior-session IEX trade, which
+    # would price the limit below market and never fill) -> caller falls back to a market order.
+    _ANCHOR_MAX_AGE_S = 300.0
+
     def __init__(self, settings: Settings, cache_dir: str = "data/cache") -> None:
         settings.assert_keys()
         self.client = StockHistoricalDataClient(settings.api_key, settings.api_secret)
         self.feed = _feed(settings.feed)
+        self._anchor_feed = self.feed if self.feed in (DataFeed.IEX, DataFeed.SIP) else DataFeed.IEX
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def latest_price(self, symbol: str) -> float | None:
-        """Most recent trade price (real-time IEX, free) for anchoring marketable limits;
-        None on any error so the caller can fall back to a market order."""
+        """Most recent trade price for anchoring marketable limits; None on any error, a
+        non-positive price, OR a stale print, so the caller can fall back to a market order
+        rather than anchoring on a stale (e.g. prior-session) price that would never fill."""
         try:
-            req = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
-            return float(self.client.get_stock_latest_trade(req)[symbol].price)
+            req = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=self._anchor_feed)
+            trade = self.client.get_stock_latest_trade(req)[symbol]
+            price = float(trade.price)
+            if price <= 0:
+                return None
+            ts = getattr(trade, "timestamp", None)
+            if ts is not None and (datetime.now(timezone.utc) - ts).total_seconds() > self._ANCHOR_MAX_AGE_S:
+                return None  # stale print -> don't anchor a live limit on it
+            return price
         except Exception:
             return None
 

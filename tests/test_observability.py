@@ -117,8 +117,44 @@ def test_watchdog_no_latch_when_positions_remain(tmp_path):
     p = str(tmp_path / "hb.json")
     _write_stale(p)
     broker = _Broker(is_open=True, flatten_clears=False, leftover={"AAPL": 5})
-    fired = check_once(broker, _Alerter(), p, 180, LOG, already_fired=False)
+    # confirm_timeout=0 -> read positions once and decide (don't sleep the full bounded poll).
+    fired = check_once(broker, _Alerter(), p, 180, LOG, already_fired=False, confirm_timeout=0.0)
     assert fired is False and broker.flattened == 1  # incomplete flatten must not latch
+
+
+class _AsyncBroker:
+    """Flatten submits async closes: positions clear only after a couple of poll reads, like
+    Alpaca's close_all_positions where fills land seconds after the call returns."""
+
+    def __init__(self, clears_after=2):
+        self._open = True
+        self.flattened = 0
+        self._reads = 0
+        self._clears_after = clears_after
+        self._positions = {"AAPL": 5}
+
+    def is_market_open(self):
+        return self._open
+
+    def flatten_all(self):
+        self.flattened += 1
+
+    def positions(self):
+        self._reads += 1
+        if self._reads > self._clears_after:
+            self._positions = {}
+        return dict(self._positions)
+
+
+def test_watchdog_confirms_flat_after_async_fills(tmp_path):
+    # The bounded poll must wait out the async close fills and then latch (not false-alarm
+    # 'positions remain' on the submit-latency right after flatten_all()).
+    p = str(tmp_path / "hb.json")
+    _write_stale(p)
+    broker = _AsyncBroker(clears_after=2)
+    fired = check_once(broker, _Alerter(), p, 180, LOG, already_fired=False,
+                       confirm_timeout=5.0, confirm_poll=0.01)
+    assert fired is True and broker.flattened == 1  # confirmed flat once the fills landed
 
 
 def test_watchdog_degraded_on_market_state_error(tmp_path):

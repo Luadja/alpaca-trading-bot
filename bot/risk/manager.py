@@ -25,6 +25,10 @@ class RiskConfig:
     max_daily_loss_pct: float = 0.03  # kill-switch threshold vs. day-start equity
     max_weekly_loss_pct: float = 0.06  # kill-switch threshold vs. week-start equity
     max_monthly_loss_pct: float = 0.10  # kill-switch threshold vs. month-start equity
+    # Trailing peak-to-trough breaker (0 = OFF). Latches when equity falls this far below the
+    # high-water mark; clears when a new high is made. Complements the calendar-anchored
+    # daily/weekly/monthly stops with an all-time-peak drawdown guard.
+    max_drawdown_from_peak_pct: float = 0.0
     allow_fractional: bool = False  # whole shares avoid fractional-order constraints
     # Inverse-volatility sizing: size each position to ~vol_target_pct annualized vol when a
     # per-symbol sigma is supplied (equalizes risk across quiet/jumpy names). Off by default.
@@ -51,6 +55,7 @@ class RiskManager:
         halted_day: bool = False,
         halted_week: bool = False,
         halted_month: bool = False,
+        halted_drawdown: bool = False,
     ) -> None:
         if day_start_equity <= 0:
             raise ValueError("day_start_equity must be positive")
@@ -66,11 +71,12 @@ class RiskManager:
         self._halted_day = halted_day
         self._halted_week = halted_week
         self._halted_month = halted_month
+        self._halted_drawdown = halted_drawdown
 
-    # --- kill switch (daily / weekly / monthly horizons) -------------------
+    # --- kill switch (daily / weekly / monthly / drawdown horizons) --------
     @property
     def halted(self) -> bool:
-        return self._halted_day or self._halted_week or self._halted_month
+        return self._halted_day or self._halted_week or self._halted_month or self._halted_drawdown
 
     def daily_pnl_pct(self, equity: float) -> float:
         return (equity - self.day_start_equity) / self.day_start_equity
@@ -81,6 +87,11 @@ class RiskManager:
     def monthly_pnl_pct(self, equity: float) -> float:
         return (equity - self.month_start_equity) / self.month_start_equity
 
+    def drawdown_pct(self, equity: float) -> float:
+        if self.high_water_mark <= 0:
+            return 0.0
+        return (equity - self.high_water_mark) / self.high_water_mark
+
     def halt_reason(self, equity: float) -> str:
         """Human-readable reason naming the horizon(s) actually latched (not always daily)."""
         parts = []
@@ -90,6 +101,8 @@ class RiskManager:
             parts.append(f"week {self.weekly_pnl_pct(equity) * 100:.2f}%")
         if self._halted_month:
             parts.append(f"month {self.monthly_pnl_pct(equity) * 100:.2f}%")
+        if self._halted_drawdown:
+            parts.append(f"drawdown {self.drawdown_pct(equity) * 100:.2f}% from peak")
         return ", ".join(parts) or "loss limit"
 
     def breached_daily_loss(self, equity: float) -> bool:
@@ -118,6 +131,12 @@ class RiskManager:
             self._halted_week = True
         if self.breached_monthly_loss(equity):
             self._halted_month = True
+        # Trailing peak-to-trough breaker (opt-in). Clear on a new high; latch on a breach.
+        if self.config.max_drawdown_from_peak_pct > 0:
+            if equity >= self.high_water_mark:
+                self._halted_drawdown = False
+            elif self.drawdown_pct(equity) <= -self.config.max_drawdown_from_peak_pct:
+                self._halted_drawdown = True
         return self.halted
 
     def reset_day(self, equity: float) -> None:
@@ -150,6 +169,7 @@ class RiskManager:
             "halted_day": self._halted_day,
             "halted_week": self._halted_week,
             "halted_month": self._halted_month,
+            "halted_drawdown": self._halted_drawdown,
         }
 
     # --- sizing & gates ----------------------------------------------------

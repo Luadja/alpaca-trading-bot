@@ -6,6 +6,8 @@ own plain dataclasses so they stay free of pydantic/Alpaca at test time.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -47,6 +49,14 @@ class Settings(BaseSettings):
     use_vol_targeting: bool = Field(default=False, validation_alias="BOT_VOL_TARGETING")
     vol_target_pct: float = Field(default=0.02, validation_alias="BOT_VOL_TARGET_PCT")
 
+    # Allow fractional shares so a high-priced symbol on a small account is still tradeable
+    # (whole-share sizing floors to 0 when equity*max_position_pct < one share). Off = whole
+    # shares only (avoids fractional-order constraints).
+    allow_fractional: bool = Field(default=False, validation_alias="BOT_ALLOW_FRACTIONAL")
+    # Trailing peak-to-trough kill switch (0 = off): halt when equity falls this far below its
+    # high-water mark, on top of the calendar daily/weekly/monthly stops.
+    max_drawdown_from_peak_pct: float = Field(default=0.0, validation_alias="BOT_MAX_DRAWDOWN_PCT")
+
     # Trend strategy: enter when already in an uptrend (fast>slow) on startup, not only on a
     # fresh golden cross. Off by default — changes signal counts, so validate first.
     trend_enter_on_regime: bool = Field(default=False, validation_alias="BOT_TREND_ENTER_ON_REGIME")
@@ -62,9 +72,12 @@ class Settings(BaseSettings):
     # silently invalidate the regime gate — this is just a lower bound.
     warmup_bars: int = 220
 
-    # Local SQLite ledger path + liveness heartbeat (read by the watchdog).
-    ledger_path: str = "data/ledger.sqlite"
-    heartbeat_path: str = "data/heartbeat.json"
+    # Local SQLite ledger path + liveness heartbeat (read by the watchdog). Both take an env
+    # override and are resolved to ABSOLUTE paths so a separately-deployed watchdog (often a
+    # different CWD/container) can be pointed at the exact same files — a relative path would
+    # otherwise resolve differently and let the watchdog read a missing file and flatten.
+    ledger_path: str = Field(default="data/ledger.sqlite", validation_alias="BOT_LEDGER_PATH")
+    heartbeat_path: str = Field(default="data/heartbeat.json", validation_alias="BOT_HEARTBEAT_PATH")
 
     # Alerting (all optional — unset = log-only). Slack incoming webhook and/or SMTP email.
     alert_slack_webhook: str = Field(default="", validation_alias="ALERT_SLACK_WEBHOOK")
@@ -76,10 +89,28 @@ class Settings(BaseSettings):
 
     @field_validator("symbols")
     @classmethod
-    def _symbols_non_empty(cls, v: list[str]) -> list[str]:
-        if not v:
+    def _symbols_clean(cls, v: list[str]) -> list[str]:
+        # Alpaca normalizes tickers to uppercase in bar responses; a lowercase/padded symbol
+        # would miss the multiindex key (df.xs KeyError) and silently never trade.
+        cleaned = [s.strip().upper() for s in v if s and s.strip()]
+        if not cleaned:
             raise ValueError("BOT_SYMBOLS must list at least one symbol")
-        return v
+        return cleaned
+
+    @field_validator("feed")
+    @classmethod
+    def _feed_known(cls, v: str) -> str:
+        # Fail closed: an ALPACA_FEED typo must not silently degrade to thin IEX (~3% of
+        # volume), which would compute the 50/200 SMAs off sparse bars.
+        fv = v.strip().lower()
+        if fv not in {"iex", "sip", "delayed_sip"}:
+            raise ValueError("ALPACA_FEED must be one of: iex, sip, delayed_sip")
+        return fv
+
+    @field_validator("ledger_path", "heartbeat_path")
+    @classmethod
+    def _resolve_abspath(cls, v: str) -> str:
+        return str(Path(v).expanduser().resolve())
 
     @field_validator("slippage_cap_pct")
     @classmethod
