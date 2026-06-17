@@ -16,23 +16,34 @@ if (-not (Test-Path $py)) { $py = "python" }   # fall back to PATH python
 
 Write-Host "Project: $root"
 $wd = $null
+$bot = $null
 try {
     while ($true) {
-        # (Re)launch the watchdog if it isn't running, so the dead-man's switch is always up.
+        # Supervise BOTH processes every tick. Running the bot in the FOREGROUND would block
+        # this loop for hours/days (1Day strategy), so a watchdog that died mid-session would
+        # never be relaunched and the dead-man's switch would silently disappear. Run both in
+        # the background and relaunch whichever has exited.
         if ($null -eq $wd -or $wd.HasExited) {
             Write-Host "$(Get-Date -Format o)  (re)starting watchdog..."
             $wd = Start-Process -FilePath $py -ArgumentList "-m", "scripts.watchdog" -WorkingDirectory $root -PassThru
         }
-        Write-Host "$(Get-Date -Format o)  starting bot (interval ${Interval}s)..."
-        & $py -m bot.run --interval $Interval
-        Write-Host "$(Get-Date -Format o)  bot exited (code $LASTEXITCODE) - restarting in ${RestartDelaySec}s (Ctrl+C to stop)."
-        Start-Sleep -Seconds $RestartDelaySec
+        if ($null -eq $bot -or $bot.HasExited) {
+            if ($null -ne $bot) {
+                Write-Host "$(Get-Date -Format o)  bot exited (code $($bot.ExitCode)) - restarting in ${RestartDelaySec}s."
+                Start-Sleep -Seconds $RestartDelaySec
+            }
+            Write-Host "$(Get-Date -Format o)  starting bot (interval ${Interval}s)..."
+            $bot = Start-Process -FilePath $py -ArgumentList "-m", "bot.run", "--interval", $Interval -WorkingDirectory $root -PassThru
+        }
+        Start-Sleep -Seconds 15   # supervision poll
     }
 }
 finally {
-    # Don't leave the watchdog orphaned when the launcher stops.
-    if ($wd -and -not $wd.HasExited) {
-        Write-Host "Stopping watchdog (pid $($wd.Id))..."
-        Stop-Process -Id $wd.Id -Force -ErrorAction SilentlyContinue
+    # Don't leave either process orphaned when the launcher stops.
+    foreach ($p in @($bot, $wd)) {
+        if ($p -and -not $p.HasExited) {
+            Write-Host "Stopping pid $($p.Id)..."
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        }
     }
 }

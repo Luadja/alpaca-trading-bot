@@ -243,6 +243,12 @@ class TradingBot:
         longer 'working'. Does NOT hold self._lock across the network submit (the Ledger
         serializes its own writes); holding it here would starve the fast safety poll during a
         multi-symbol crash."""
+        # If the kill switch has tripped, safety_poll's flatten_all() owns the liquidation (it
+        # cancels open orders AND closes every position); submitting our own SELL alongside it
+        # could double-sell the same long into a short. Defer to it.
+        with self._lock:
+            if self.risk.halted:
+                return 0.0, "halted"
         try:
             working = sum(
                 float(o.qty or 0) for o in self.broker.open_orders()
@@ -250,13 +256,19 @@ class TradingBot:
             )
         except Exception:
             working = 0.0  # can't read open orders -> fall through and submit (fail-safe)
-        if working >= qty:
+        # Cap to the LIVE position (the qty passed in is from step()'s snapshot and may be stale
+        # if a concurrent flatten already reduced it), so we never sell more than we hold.
+        try:
+            live_held = self.broker.position_qty(symbol)
+        except Exception:
+            live_held = qty
+        remaining = max(0.0, min(qty - working, live_held))
+        if remaining <= 0:
             self.log.warning(
-                "%s: catastrophic SELL already working (%.0f sh resting) — not restacking",
-                symbol, working,
+                "%s: catastrophic SELL covered (working=%.0f live_held=%.0f) — not restacking",
+                symbol, working, live_held,
             )
             return 0.0, "working"
-        remaining = qty - working
         coid = f"bot-catstop-{symbol}-{time.time_ns()}"
         self.ledger.record_intent(coid, symbol, "sell", remaining, "catastrophic stop")
         order = self.broker.submit_market(symbol, remaining, OrderSide.SELL, client_order_id=coid)
@@ -336,7 +348,10 @@ class TradingBot:
             if not retry and self.ledger.already_submitted(coid):
                 return 0.0  # already acted on this exact bar — idempotent
             self.ledger.record_intent(coid, symbol, "buy", qty, decision.reason)
-            if ref:
+            # A marketable LIMIT needs a whole-share qty (Alpaca rejects a fractional limit with
+            # 422); a fractional qty (allow_fractional) must go as a market order or it never
+            # trades. Anchor the limit on the live price only when qty is whole.
+            if ref and float(qty).is_integer():
                 limit = round(ref * (1 + self.settings.slippage_cap_pct), 2)
                 order = self.broker.submit_limit(symbol, qty, OrderSide.BUY, limit, client_order_id=coid)
             else:
@@ -578,16 +593,28 @@ class TradingBot:
     def _retry_coid(self, symbol: str, side: str, bar_ts) -> tuple[str, bool]:
         """Return (coid, is_retry). Normally the deterministic per-bar coid (idempotent). But
         on a daily timeframe that coid is stable ALL session, so if a prior attempt for this
-        exact decision TERMINATED UNFILLED (rejected/canceled/expired/done_for_day) it is stuck
-        terminal-and-non-resubmittable and the wanted order would be abandoned for the rest of
-        the day. In that case return a FRESH retry id. Double-execution is prevented by the
-        caller's live-position/signal gate (exit needs held>0, entry needs held==0), so once a
-        retry fills the decision is no longer re-issued."""
+        exact decision did NOT complete (terminal status, e.g. rejected/canceled/expired, or a
+        partial-then-canceled with a residual), the deterministic id is stuck terminal-and-
+        non-resubmittable and the wanted order would be abandoned for the rest of the day. In
+        that case return a FRESH retry id — BUT only if no earlier retry is still working, else
+        each cycle would stack another live order and two could both fill (double entry /
+        oversell). Double-execution after a fill is otherwise prevented by the caller's
+        live-position gate (exit needs held>0, entry needs held==0)."""
         coid = self._coid(symbol, side, bar_ts)
         prior = self.ledger.order_state(coid)
-        if prior and prior["status"] in _TERMINAL_UNFILLED and prior["filled_qty"] == 0:
-            return f"{coid}-r{time.time_ns()}", True
-        return coid, False
+        if not (prior and prior["status"] in _TERMINAL_UNFILLED):
+            return coid, False  # fresh, or live/filled -> deterministic idempotent path
+        # The deterministic attempt is terminal-incomplete. Don't issue a fresh retry while a
+        # previous retry is still resting on the book (mirror the catastrophic-stop guard).
+        try:
+            working = any(
+                o.symbol == symbol and _order_side(o) == side for o in self.broker.open_orders()
+            )
+        except Exception:
+            working = True  # can't confirm -> don't risk stacking a second live order this cycle
+        if working:
+            return coid, False  # a retry is still working; already_submitted() suppresses a dupe
+        return f"{coid}-r{time.time_ns()}", True
 
 
 def main() -> None:

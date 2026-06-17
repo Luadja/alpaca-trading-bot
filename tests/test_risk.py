@@ -163,6 +163,18 @@ def test_trailing_drawdown_breaker_latches_and_clears():
     assert not rm.halted
 
 
+def test_trailing_drawdown_latch_clears_when_breaker_disabled():
+    # A latched drawdown halt rehydrated from a prior run must CLEAR if the breaker is now off
+    # (config pct = 0), else the bot would stay halted forever.
+    rm = RiskManager(
+        RiskConfig(max_daily_loss_pct=0.99, max_weekly_loss_pct=0.99, max_monthly_loss_pct=0.99),
+        day_start_equity=100_000, high_water_mark=100_000, halted_drawdown=True,
+    )
+    assert rm.halted  # rehydrated as halted
+    rm.update(98_000)  # breaker disabled (default 0) -> latch must clear
+    assert not rm.halted
+
+
 def test_trailing_drawdown_off_when_zero():
     rm = RiskManager(
         RiskConfig(max_daily_loss_pct=0.99, max_weekly_loss_pct=0.99, max_monthly_loss_pct=0.99),

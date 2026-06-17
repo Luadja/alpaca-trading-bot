@@ -137,6 +137,10 @@ class RiskManager:
                 self._halted_drawdown = False
             elif self.drawdown_pct(equity) <= -self.config.max_drawdown_from_peak_pct:
                 self._halted_drawdown = True
+        else:
+            # Breaker disabled: clear any latch rehydrated from a prior run that HAD it on,
+            # otherwise a persisted halted_drawdown=True would halt the bot forever.
+            self._halted_drawdown = False
         return self.halted
 
     def reset_day(self, equity: float) -> None:

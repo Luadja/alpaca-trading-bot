@@ -42,13 +42,19 @@ def _await_flat(broker, log, timeout: float, poll: float) -> dict:
 
 
 def check_once(broker, alerter, heartbeat_path: str, max_age: float, log, *, already_fired: bool,
-               confirm_timeout: float = 15.0, confirm_poll: float = 1.0) -> bool:
+               confirm_timeout: float = 15.0, confirm_poll: float = 1.0,
+               startup_grace: float = 0.0, elapsed: float | None = None) -> bool:
     """One watchdog check. Returns the new 'already_fired' latch state.
 
     Flattens (once per staleness episode) when the market is open and the heartbeat is
     missing or older than max_age. The latch resets when a fresh heartbeat reappears, and
     is NOT set unless the account is confirmed flat (after a bounded poll for the async close
     fills) — so a failed/incomplete flatten retries next tick.
+
+    Startup grace: a MISSING heartbeat within ``startup_grace`` seconds of launch (``elapsed``)
+    is treated as not-yet-stale — the bot may simply not have written its first heartbeat yet,
+    and flattening then would liquidate a healthy account at cold start. An EXISTING-but-old
+    heartbeat is always immediately stale (a genuine crash), regardless of grace.
     """
     try:
         market_open = broker.is_market_open()
@@ -64,8 +70,16 @@ def check_once(broker, alerter, heartbeat_path: str, max_age: float, log, *, alr
 
     hb = read_heartbeat(heartbeat_path)
     age = heartbeat_age_seconds(hb) if hb else None
-    # Stale if missing, unusable, too old, OR implausibly in the future (clock skew).
-    stale = hb is None or age is None or age > max_age or age < -max_age
+    if hb is None:
+        # Within the cold-start grace, a missing heartbeat is the bot still starting up, not a
+        # dead bot — do NOT flatten yet. After the grace, a missing heartbeat is genuinely stale.
+        in_grace = elapsed is not None and elapsed <= startup_grace
+        if in_grace:
+            return already_fired
+        stale = True
+    else:
+        # Existing heartbeat: stale if unusable, too old, OR implausibly in the future (skew).
+        stale = age is None or age > max_age or age < -max_age
 
     if not stale:
         if already_fired:
@@ -98,7 +112,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Dead-man's-switch watchdog for the trading bot")
     ap.add_argument("--max-age", type=float, default=180.0, help="max heartbeat age (s) before flattening")
     ap.add_argument("--interval", type=float, default=30.0, help="check interval (s)")
+    ap.add_argument("--startup-grace", type=float, default=None,
+                    help="seconds to tolerate a MISSING heartbeat at launch before flattening "
+                         "(default: max(max_age, 120) — lets the bot write its first heartbeat)")
     args = ap.parse_args()
+    startup_grace = args.startup_grace if args.startup_grace is not None else max(args.max_age, 120.0)
 
     settings = load_settings()
     log = setup_logging(log_file="logs/watchdog.log")
@@ -114,14 +132,17 @@ def main() -> None:
 
     broker = Broker(settings)
     alerter = alerter_from_settings(settings)
-    log.info("Watchdog started: max-age=%.0fs interval=%.0fs path=%s",
-             args.max_age, args.interval, settings.heartbeat_path)
+    start = time.monotonic()
+    log.info("Watchdog started: max-age=%.0fs interval=%.0fs startup-grace=%.0fs path=%s",
+             args.max_age, args.interval, startup_grace, settings.heartbeat_path)
 
     fired = False
     overnight_alerted = False
     while True:
         try:
-            fired = check_once(broker, alerter, settings.heartbeat_path, args.max_age, log, already_fired=fired)
+            fired = check_once(broker, alerter, settings.heartbeat_path, args.max_age, log,
+                               already_fired=fired, startup_grace=startup_grace,
+                               elapsed=time.monotonic() - start)
             # A bot that died with positions open into/after the close can't be flattened by a
             # market-closed watchdog (DAY closes won't fill until the next open). Surface it once
             # so a human can act, instead of silently carrying the position overnight.

@@ -89,6 +89,33 @@ def test_watchdog_missing_heartbeat_flattens(tmp_path):
     assert fired is True and broker.flattened == 1
 
 
+def test_watchdog_startup_grace_no_flatten_on_missing_heartbeat(tmp_path):
+    # Cold start: the bot hasn't written its first heartbeat yet. Within the grace, a MISSING
+    # heartbeat must NOT flatten a (possibly healthy) account.
+    broker = _Broker(is_open=True, leftover={"AAPL": 5})
+    fired = check_once(broker, _Alerter(), str(tmp_path / "none.json"), 180, LOG,
+                       already_fired=False, startup_grace=120.0, elapsed=10.0)
+    assert fired is False and broker.flattened == 0  # within grace -> no flatten
+
+
+def test_watchdog_flattens_after_grace_elapses(tmp_path):
+    # Past the grace, a still-missing heartbeat is a genuine dead bot -> flatten.
+    broker = _Broker(is_open=True)
+    fired = check_once(broker, _Alerter(), str(tmp_path / "none.json"), 180, LOG,
+                       already_fired=False, startup_grace=120.0, elapsed=200.0)
+    assert fired is True and broker.flattened == 1
+
+
+def test_watchdog_existing_stale_heartbeat_ignores_grace(tmp_path):
+    # An EXISTING but old heartbeat is a real crash; the grace must not protect it.
+    p = str(tmp_path / "hb.json")
+    _write_stale(p)
+    broker = _Broker(is_open=True)
+    fired = check_once(broker, _Alerter(), p, 180, LOG,
+                       already_fired=False, startup_grace=9999.0, elapsed=1.0)
+    assert fired is True and broker.flattened == 1
+
+
 def test_watchdog_fresh_resets_latch(tmp_path):
     p = str(tmp_path / "hb.json")
     write_heartbeat(p, {"halted": False})
