@@ -20,10 +20,26 @@ MEGACAP_BIASED = [
 ]
 
 # Survivorship-FREE: broad-market + sector ETFs (each ETF persists, reconstitution is
-# internal), so a long-only backtest here isn't hand-picked to winners.
+# internal), so a long-only backtest here isn't hand-picked to winners. NOTE: these are ALL
+# US equity, so they're highly correlated (~0.8-0.95) — little real diversification.
 ETF_UNIVERSE = [
     "SPY", "QQQ", "IWM", "DIA",
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLU", "XLY", "XLB", "XLC", "XLRE",
+]
+
+# Survivorship-FREE, CROSS-ASSET: deliberately diversified across 6 low-correlation classes.
+# Trend-following has its strongest, best-documented edge applied ACROSS uncorrelated asset
+# classes (the managed-futures / time-series-momentum result) — more independent trends to
+# ride and lower portfolio drawdown than an all-equity set. All have history well before the
+# 2018 backtest window.
+MULTI_ASSET = [
+    "SPY", "QQQ", "IWM",   # US equity
+    "EFA", "EEM",          # international: developed + emerging
+    "TLT", "IEF",          # Treasuries: long + intermediate (the key equity diversifier)
+    "LQD", "HYG",          # credit: investment-grade + high-yield
+    "GLD",                 # gold
+    "DBC",                 # broad commodities
+    "VNQ",                 # REITs
 ]
 
 
@@ -49,6 +65,8 @@ def resolve_universe(spec: str) -> tuple[list[str], dict[str, tuple[date, date]]
     """Resolve ``spec`` ('etf' | 'megacap' | a CSV path) to (symbols, windows|None, is_biased)."""
     if spec == "etf":
         return ETF_UNIVERSE, None, False
+    if spec in ("multiasset", "multi_asset", "broad"):
+        return MULTI_ASSET, None, False
     if spec == "megacap":
         return MEGACAP_BIASED, None, True
     if Path(spec).is_file():
