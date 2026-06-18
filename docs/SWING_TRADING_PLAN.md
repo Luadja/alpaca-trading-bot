@@ -89,7 +89,45 @@ trailing + time exits. New broker methods: `submit_bracket()`, OCO/leg handling,
 - Keep it paper or token money — consistent with your (sound) decision not to fund the edge.
 
 ## 5. Decisions to lock before building
-1. **Timeframe** — daily (recommended start) vs intraday?
-2. **Strategy flavor** — mean-reversion / breakout / momentum (one, or a couple)?
-3. **Universe** — volatile stocks / leveraged ETFs / crypto?
-4. **Long-only** (reuse) vs **add shorting** (bigger lift)?
+1. **Timeframe** — daily (recommended start) vs intraday?  → **CHOSEN: intraday (1H/15min)**
+2. **Strategy flavor** — mean-reversion / breakout / momentum?  → **CHOSEN: mean-reversion bounce**
+3. **Universe** — volatile stocks / leveraged ETFs / crypto?  → **CHOSEN: crypto**
+4. **Long-only vs add shorting?**  → **CHOSEN: long/short** ⚠️ *conflicts with crypto — see §6*
+
+---
+
+## 6. Chosen direction: Crypto · Intraday · Mean-reversion · Long/Short
+This is the most ambitious combination — effectively a **new bot** that reuses the
+safety/ledger/alerting/infra but rewrites the data, market-clock, order, and run-loop layers.
+
+### ⚠️ Blocking conflict: Alpaca crypto is SPOT-ONLY — you can't short it
+Shorting on Alpaca is an **equities/margin** feature; crypto has no borrow/margin/short. So
+"crypto **and** shorting" cannot both be true on Alpaca. (Confirm against current Alpaca docs,
+but this has long been the case.) Resolve one way:
+- **(A) Crypto, LONG-ONLY** *(recommended)* — drop shorting. Mean-reversion is naturally
+  long-biased (buy oversold dips), so we lose little, and it's the simplest crypto path.
+- **(B) Stocks / leveraged-ETFs, LONG/SHORT** — keep shorting, drop crypto (back to
+  market-hours equities; can short overbought names on a margin account).
+- **(C) Crypto long + inverse-ETF "shorts"** — mixes 24/7 crypto with market-hours ETFs; messy, not recommended.
+
+### Crypto-specific new plumbing (on top of §2)
+- **24/7 run loop** — remove the `is_market_open()` gating that early-returns when closed;
+  crypto trades around the clock. Scheduler, heartbeat, and watchdog all run 24/7 (no
+  market-hours logic). Touches the core loop, watchdog, and go-live checks.
+- **Crypto data layer** — `CryptoHistoricalDataClient` + `CryptoBarsRequest` (separate from
+  stocks). No SIP/IEX feed, no 15-min rule, no 16-min clamp — real-time and free. Symbols like
+  `BTC/USD`, `ETH/USD`, `SOL/USD`.
+- **Crypto orders** — natively fractional (no whole-share floor). ⚠️ crypto likely does **not**
+  support bracket/OCO orders, so the position-management layer (§2B) **must be bot-side**
+  (monitor TP/SL/trailing/time each cycle and submit exits); §2C broker-brackets won't apply.
+- **Crypto fees** — ~0.1–0.25%/side (vs commission-free stocks) → costs bite hard on
+  high-frequency mean-reversion; model them in the backtest.
+- **Risk/annualization** — crypto is far more volatile (−50%+ drawdowns are normal); ATR stops
+  + kill-switch limits need crypto tuning; metrics annualize on 365×24h, not 252 trading days.
+
+### Revised phasing (crypto)
+- **Phase 1 (MVP):** 24/7 loop + crypto data + crypto orders (fractional, bot-side exits) + one
+  mean-reversion strategy (RSI/StochRSI bounce) on 2–3 liquid pairs (BTC/ETH/SOL) + a crypto
+  backtest with realistic fees. Paper, long-only.
+- **Phase 2:** trailing/time exits, more pairs, open-trades dashboard, fee/cost tuning.
+- **Phase 3:** *only if you choose option (B)* — shorting on stocks (not crypto).
