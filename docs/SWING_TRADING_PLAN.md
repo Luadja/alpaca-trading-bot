@@ -130,3 +130,28 @@ but this has long been the case.) Resolve one way:
   backtest with realistic fees. Paper, long-only.
 - **Phase 2:** trailing/time exits, more pairs, open-trades dashboard, fee/cost tuning.
 - **Phase 3:** *only if you choose option (B)* — shorting on stocks (not crypto).
+
+---
+
+## 7. BUILT — Phase 1 status & the honest verdict (2026-06-18)
+
+**Built end-to-end and shipped (paper):**
+- Crypto data layer (`get_crypto_bars`, `crypto_price`), 24/7 run-loop mode (`bot/run.py` `market="crypto"`),
+  crypto GTC fractional orders (`submit_crypto_market`), bot-side channel exit, ATR-free Donchian
+  sizing via the existing risk caps, crypto-armed watchdog, one-command launcher (`scripts/run_crypto.ps1`).
+- Strategies tried + backtested: intraday mean-reversion, daily mean-reversion, **daily momentum/breakout**
+  (`bot/strategy/breakout.py`). Backtesters: `crypto_swing.py`, `crypto_momentum.py`, `_sweep.py`, `_validate.py`.
+- 147 tests pass. Two adversarial multi-agent reviews (research + wiring) — no must-fix bugs.
+
+**The honest verdict — NO demonstrated edge (this is why it ships as a *playground*, not a strategy):**
+- Mean-reversion: dead on crypto (intraday = fee bleed; daily = no edge).
+- Momentum/breakout looked good in-sample (median +35%, 68% pairs profitable) but the adversarial
+  teardown broke it: **fails walk-forward** (H1 +54% → H2 −16%/28% win — the recent regime LOST),
+  **survivorship-inflated** (universe = coins alive today), **wrong benchmark** (only beats the dead-alt
+  basket; ties a zero-effort BTC+cash blend; captures ~⅓ of just-holding-BTC). Honest forward
+  expectation: **flat-to-negative**, bounded losses, big upside only if a fresh sustained bull recurs.
+- Same lesson as the equities research: trends pay only *in* trends, and you can't time the regime.
+
+**Run it:** `powershell -ExecutionPolicy Bypass -File scripts\run_crypto.ps1` (paper, breakout, 1Day,
+7 liquid pairs, isolated ledger, watchdog armed). Kill switch auto-widened for crypto vol
+(15%/30%/50%; catastrophic 25%). Startup logs a loud "no edge / paper only" caveat. **Do not fund.**
