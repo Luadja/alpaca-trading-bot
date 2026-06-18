@@ -51,3 +51,50 @@ def test_negative_slippage_cap_rejected(monkeypatch):
         assert "slippage" in str(exc).lower()
         return
     raise AssertionError("negative slippage cap should be rejected")
+
+
+def test_stock_keeps_tight_kill_switch_defaults():
+    s = _settings()  # market defaults to stock
+    assert s.max_daily_loss_pct == 0.03
+    assert s.max_weekly_loss_pct == 0.06
+    assert s.max_monthly_loss_pct == 0.10
+    assert s.catastrophic_stop_pct == 0.10
+
+
+def test_crypto_widens_kill_switch_defaults(monkeypatch):
+    # Crypto routinely swings >3% intraday; the stock 3% daily latch would halt it daily.
+    monkeypatch.setenv("BOT_MARKET", "crypto")
+    s = _settings()
+    assert s.max_daily_loss_pct == 0.15
+    assert s.max_weekly_loss_pct == 0.30
+    assert s.max_monthly_loss_pct == 0.50
+    assert s.catastrophic_stop_pct == 0.25
+
+
+def test_crypto_respects_explicit_loss_override(monkeypatch):
+    # An explicit override must win; the others still widen to crypto defaults.
+    monkeypatch.setenv("BOT_MARKET", "crypto")
+    monkeypatch.setenv("BOT_MAX_DAILY_LOSS_PCT", "0.05")
+    s = _settings()
+    assert s.max_daily_loss_pct == 0.05
+    assert s.max_weekly_loss_pct == 0.30
+
+
+def test_market_validator_rejects_unknown(monkeypatch):
+    monkeypatch.setenv("BOT_MARKET", "forex")
+    try:
+        _settings()
+    except Exception as exc:
+        assert "market" in str(exc).lower()
+        return
+    raise AssertionError("unknown market should be rejected")
+
+
+def test_duplicate_normalized_symbols_rejected(monkeypatch):
+    monkeypatch.setenv("BOT_SYMBOLS", '["BTC/USD","BTCUSD"]')  # collapse to the same canonical key
+    try:
+        _settings()
+    except Exception as exc:
+        assert "normaliz" in str(exc).lower() or "duplicate" in str(exc).lower()
+        return
+    raise AssertionError("duplicate-normalized symbols should be rejected")

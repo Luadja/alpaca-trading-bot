@@ -1,6 +1,7 @@
 """Trading strategies. Strategy code is PURE: data in, signals out, no broker calls."""
 
 from bot.strategy.base import Strategy
+from bot.strategy.breakout import BreakoutParams, BreakoutStrategy
 from bot.strategy.mean_reversion import MeanReversionParams, MeanReversionStrategy
 from bot.strategy.stoch_rsi_mfi import StochRsiMfiParams, StochRsiMfiStrategy, compute_signals
 from bot.strategy.trend_momentum import TrendMomentumParams, TrendMomentumStrategy
@@ -10,6 +11,7 @@ STRATEGIES: dict[str, type[Strategy]] = {
     "stoch_rsi_mfi": StochRsiMfiStrategy,
     "trend_momentum": TrendMomentumStrategy,
     "mean_reversion": MeanReversionStrategy,
+    "breakout": BreakoutStrategy,
 }
 
 
@@ -30,6 +32,8 @@ __all__ = [
     "TrendMomentumParams",
     "MeanReversionStrategy",
     "MeanReversionParams",
+    "BreakoutStrategy",
+    "BreakoutParams",
     "STRATEGIES",
     "make_strategy",
 ]

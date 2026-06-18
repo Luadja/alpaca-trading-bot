@@ -35,7 +35,13 @@ from bot.logging_setup import setup_logging
 from bot.models import SignalDecision, SignalType
 from bot.risk import RiskConfig, RiskManager
 from bot.state import Ledger
-from bot.strategy import TrendMomentumParams, TrendMomentumStrategy, make_strategy
+from bot.strategy import (
+    BreakoutParams,
+    BreakoutStrategy,
+    TrendMomentumParams,
+    TrendMomentumStrategy,
+    make_strategy,
+)
 
 try:
     from zoneinfo import ZoneInfo
@@ -101,6 +107,11 @@ class TradingBot:
         # Serializes the kill-switch / risk-state / order-submit critical sections so the
         # fast safety_poll thread can't flatten between an entry's gate-check and its submit.
         self._lock = threading.RLock()
+        self.is_crypto = settings.market == "crypto"
+        # Canonical-key -> managed-symbol map so we can match broker position/order symbols to
+        # our configured symbols regardless of crypto slash formatting ("BTC/USD" vs "BTCUSD").
+        # Identity for plain stock tickers, so the well-tested stock path is unchanged.
+        self._sym_to_managed = {self._norm(s): s for s in settings.symbols}
         self.broker = Broker(settings)
         self.data = HistoricalData(settings)
         self.strategy = self._build_strategy()
@@ -109,9 +120,16 @@ class TradingBot:
         self.timeframe = parse_timeframe(settings.timeframe)
         self._vol_annualization = _periods_per_year(settings.timeframe) ** 0.5
         self._risk_config = RiskConfig(
+            max_position_pct=settings.max_position_pct,
+            catastrophic_stop_pct=settings.catastrophic_stop_pct,
+            max_daily_loss_pct=settings.max_daily_loss_pct,
+            max_weekly_loss_pct=settings.max_weekly_loss_pct,
+            max_monthly_loss_pct=settings.max_monthly_loss_pct,
             use_vol_targeting=settings.use_vol_targeting,
             vol_target_pct=settings.vol_target_pct,
-            allow_fractional=settings.allow_fractional,
+            # Crypto is natively fractional (you can't buy whole BTC on a small account), so
+            # force fractional sizing in crypto mode regardless of the flag.
+            allow_fractional=settings.allow_fractional or self.is_crypto,
             max_drawdown_from_peak_pct=settings.max_drawdown_from_peak_pct,
         )
 
@@ -121,7 +139,9 @@ class TradingBot:
         # weekend restart), it's measured from a stale equity, not the session open. Re-anchor
         # at the first open-market read (see _reanchor_if_pending).
         try:
-            self._anchor_needs_reopen = not self.broker.is_market_open()
+            # Crypto trades 24/7 — there is no "closed" baseline to re-anchor from, so the
+            # day-start equity captured now IS the session open.
+            self._anchor_needs_reopen = not self.is_crypto and not self.broker.is_market_open()
         except Exception:
             self._anchor_needs_reopen = False
         self._reconcile_pending()  # resolve any orders left dangling by a prior crash
@@ -133,16 +153,27 @@ class TradingBot:
             self.alerter.notify("critical", "started with kill switch HALTED", "rehydrated from prior session")
         self._write_heartbeat(account.equity)  # liveness from the first moment
         self.alerter.activity(
-            f"🤖 Bot online — paper={settings.paper}, strategy={settings.strategy}, "
-            f"equity=${account.equity:,.0f}, halted={self.risk.halted}"
+            f"🤖 Bot online — paper={settings.paper}, market={settings.market}, "
+            f"strategy={settings.strategy}, equity=${account.equity:,.0f}, halted={self.risk.halted}"
         )
+        if self.is_crypto:
+            caveat = (
+                "CRYPTO PLAYGROUND — NO demonstrated edge. Backtests show flat-to-negative live "
+                "(fails walk-forward, survivorship-inflated, ties a BTC+cash blend). Results are an "
+                "UPPER BOUND. Paper only — do NOT fund this with real money."
+            )
+            self.log.warning("⚠️  %s", caveat)
+            self.alerter.activity(f"⚠️ {caveat}")
+        if not settings.paper:
+            self.log.warning("LIVE (non-paper) account configured — this is a research bot.")
 
     def step(self) -> None:
         # Liveness first, so the heartbeat stays fresh even on the early returns below
         # (closed market, kill switch) and across the market-open boundary.
         self._write_heartbeat()
-        # Don't poll/submit into a closed market (TIF=DAY would silently drop orders).
-        if not self.broker.is_market_open():
+        # Don't poll/submit into a closed market (TIF=DAY would silently drop orders). Crypto
+        # is 24/7, so _market_open() is always True there.
+        if not self._market_open():
             self.log.info("Market closed — skipping cycle.")
             return
 
@@ -152,7 +183,8 @@ class TradingBot:
         self._reconcile_pending()  # promptly resolve any slow/dangling fills
 
         positions_raw = self.broker.list_positions()
-        positions = {p.symbol: float(p.qty) for p in positions_raw}
+        # Key by canonical symbol (slash-insensitive) so crypto positions match managed symbols.
+        positions = {self._norm(p.symbol): float(p.qty) for p in positions_raw}
 
         # Kill switch: check loss limits before anything else, atomically with flatten so a
         # concurrent entry can't slip through (the lock also guards risk-state + persistence).
@@ -176,13 +208,13 @@ class TradingBot:
         # bounds TOTAL exposure across same-cycle entries (exit frees the seeded value). A
         # stop that did NOT confirm flat stays in the tally (it's still real exposure).
         position_mv = {
-            p.symbol: (abs(float(p.market_value)) if p.market_value else 0.0)
-            for p in positions_raw if p.symbol not in flat
+            self._norm(p.symbol): (abs(float(p.market_value)) if p.market_value else 0.0)
+            for p in positions_raw if self._norm(p.symbol) not in flat
         }
         running_exposure = sum(position_mv.values())
         # Reuse this cycle's positions read for the exit-activity P&L snapshot — so _exit needn't
         # make a fresh (retrying) network call that could delay a real liquidation.
-        pos_by_symbol = {p.symbol: p for p in positions_raw}
+        pos_by_symbol = {self._norm(p.symbol): p for p in positions_raw}
 
         # Market-regime gate (Faber): only allow NEW longs when the broad market is up.
         regime_ok = self._market_regime_ok()
@@ -191,7 +223,7 @@ class TradingBot:
                           self.settings.market_regime_symbol, self.settings.market_regime_sma)
 
         for symbol in self.settings.symbols:
-            if symbol in skip:
+            if self._norm(symbol) in skip:
                 continue  # stop fired (or a stop SELL is working) — don't re-act this cycle
             try:
                 running_exposure = self._evaluate_symbol(
@@ -213,10 +245,12 @@ class TradingBot:
         flatten must never look like a success."""
         skip: set = set()
         flat: set = set()
-        managed = set(self.settings.symbols)
+        managed = {self._norm(s) for s in self.settings.symbols}
         for p in positions_raw:
-            if p.symbol not in managed or float(p.qty) <= 0:
+            nk = self._norm(p.symbol)
+            if nk not in managed or float(p.qty) <= 0:
                 continue
+            sym = self._sym_to_managed.get(nk, p.symbol)  # slash-form symbol for the order
             # current_price / avg_entry_price are Optional[str]; a freshly-halted name can
             # report None (-> float(None) would crash the whole cycle) or 0 (-> false stop).
             entry = float(p.avg_entry_price) if p.avg_entry_price else 0.0
@@ -227,26 +261,26 @@ class TradingBot:
                 continue
             pct = (price / entry - 1) * 100 if entry else 0.0
             self.log.warning(
-                "%s: CATASTROPHIC STOP (entry %.2f, price %.2f, %.1f%%) — flattening",
-                p.symbol, entry, price, pct,
+                "%s: CATASTROPHIC STOP (entry %.4g, price %.4g, %.1f%%) — flattening",
+                sym, entry, price, pct,
             )
-            self.alerter.notify("warning", f"catastrophic stop: {p.symbol}", f"{pct:.1f}% from entry")
-            filled, status = self._flatten_catastrophic(p.symbol, float(p.qty))
-            skip.add(p.symbol)  # don't let the rest of the cycle trade a name we're flattening
+            self.alerter.notify("warning", f"catastrophic stop: {sym}", f"{pct:.1f}% from entry")
+            filled, status = self._flatten_catastrophic(sym, float(p.qty))
+            skip.add(nk)  # don't let the rest of the cycle trade a name we're flattening
             if status == "filled" or filled >= float(p.qty):
-                flat.add(p.symbol)
-                positions[p.symbol] = 0.0
+                flat.add(nk)
+                positions[nk] = 0.0
             elif status in ("halted", "working"):
                 # Benign defer, NOT a failed flatten: 'halted' = the kill switch owns the
                 # liquidation; 'working' = a prior stop SELL is still resting. No alert.
-                self.log.info("%s: catastrophic flatten deferred (%s)", p.symbol, status)
+                self.log.info("%s: catastrophic flatten deferred (%s)", sym, status)
             else:
                 self.log.error(
                     "%s: catastrophic flatten INCOMPLETE (status=%s filled=%s) — still exposed",
-                    p.symbol, status, filled,
+                    sym, status, filled,
                 )
                 self.alerter.notify(
-                    "critical", f"catastrophic flatten incomplete: {p.symbol}",
+                    "critical", f"catastrophic flatten incomplete: {sym}",
                     f"status={status} filled={filled} — position still open past the hard stop",
                 )
         return skip, flat
@@ -265,24 +299,24 @@ class TradingBot:
         try:
             working = sum(
                 float(o.qty or 0) for o in self.broker.open_orders()
-                if o.symbol == symbol and _order_side(o) == "sell"
+                if self._norm(o.symbol) == self._norm(symbol) and _order_side(o) == "sell"
             )
         except Exception:
             working = 0.0  # can't read open orders -> fall through and submit (fail-safe)
         # Cap to the LIVE position (the qty passed in is from step()'s snapshot and may be stale
         # if a concurrent flatten already reduced it), so we never sell more than we hold.
         try:
-            live_held = self.broker.position_qty(symbol)
+            live_held = self._live_position_qty(symbol)
         except Exception:
             live_held = qty
         remaining = max(0.0, min(qty - working, live_held))
         if remaining <= 0:
             self.log.warning(
-                "%s: catastrophic SELL covered (working=%.0f live_held=%.0f) — not restacking",
+                "%s: catastrophic SELL covered (working=%g live_held=%g) — not restacking",
                 symbol, working, live_held,
             )
             return 0.0, "working"
-        coid = f"bot-catstop-{symbol}-{time.time_ns()}"
+        coid = f"bot-catstop-{self._norm(symbol)}-{time.time_ns()}"
         # Re-check the kill switch as LATE as possible (atomically with recording intent) and
         # release before the network submit: if it tripped, safety_poll's flatten_all() owns the
         # liquidation (it cancels open orders AND closes every position), so defer rather than
@@ -292,7 +326,7 @@ class TradingBot:
             if self.risk.halted:
                 return 0.0, "halted"
             self.ledger.record_intent(coid, symbol, "sell", remaining, "catastrophic stop")
-        order = self.broker.submit_market(symbol, remaining, OrderSide.SELL, client_order_id=coid)
+        order = self._submit_order(symbol, remaining, OrderSide.SELL, coid)
         self.ledger.mark_submitted(coid, str(order.id))
         return self._await_fill(coid)
 
@@ -300,8 +334,12 @@ class TradingBot:
                          position_mv=None, buying_power=None, pos_by_symbol=None) -> float:
         # ~550 daily bars: enough that the 200-SMA is valid well before recent crosses
         # (a short window can miss the last golden/death cross). Reduce for sub-daily.
-        df = self.data.get_bars(symbol, self.timeframe, lookback_days=800, use_cache=False)
-        required = max(self.settings.warmup_bars, self.strategy.params.min_bars)
+        df = self._get_bars(symbol)
+        # Stocks enforce the warmup floor (the regime/trend SMA needs the full window). Crypto's
+        # breakout only needs its short channel window, so use the strategy's own requirement —
+        # the warmup_bars=220 floor is a stock-200-SMA artifact that would needlessly delay it.
+        required = (self.strategy.params.min_bars if self.is_crypto
+                    else max(self.settings.warmup_bars, self.strategy.params.min_bars))
         if df.empty or len(df) < required:
             self.log.warning(
                 "%s: insufficient history %d/%d bars — skipping (the symbol will not trade "
@@ -312,7 +350,7 @@ class TradingBot:
 
         bar_ts = df.index[-1]
         decision = self.strategy.generate(df, symbol)
-        held = positions.get(symbol, 0.0)
+        held = positions.get(self._norm(symbol), 0.0)
         self.log.info("%s: %s (%s)", symbol, decision.signal.value, decision.reason)
 
         if decision.signal is SignalType.ENTER_LONG and held == 0:
@@ -323,8 +361,13 @@ class TradingBot:
             # Size + gate on a LIVE price, not decision.price (the PRIOR session's close on a
             # daily timeframe), so the per-position / total-exposure caps match what the order
             # actually fills at. Fall back to the bar close only when no live price is available.
-            ref = self.data.latest_price(symbol) if self.settings.use_marketable_limit else None
-            price = ref if ref else decision.price
+            live = self._ref_price(symbol)
+            if self.is_crypto:
+                ref = None  # crypto orders are market GTC, not marketable-limit
+                price = live if live else decision.price
+            else:
+                ref = live if self.settings.use_marketable_limit else None
+                price = ref if ref else decision.price
             risk = self.risk.evaluate_entry(equity, price, running_exposure, sigma=sigma)
             if not risk.approved:
                 self.log.info("%s: entry blocked — %s", symbol, risk.reason)
@@ -338,9 +381,23 @@ class TradingBot:
                         "— fund the account, lower the cap, drop the symbol, or set BOT_ALLOW_FRACTIONAL=true",
                     )
                 return running_exposure
+            order_value = risk.qty * price
+            # Crypto: skip a sub-minimum (dust) order rather than hammer Alpaca's crypto
+            # minimum every bar with a 422 reject. Alert once (mirrors the stock 'too small'
+            # permanent-skip), since on a small account this is a standing condition.
+            if self.is_crypto and order_value < self.settings.crypto_min_notional:
+                if symbol not in self._untradeable_warned:
+                    self._untradeable_warned.add(symbol)
+                    self.alerter.notify(
+                        "warning", f"{symbol} below crypto min notional",
+                        f"order ${order_value:.2f} < ${self.settings.crypto_min_notional:.2f} — "
+                        "raise BOT_MAX_POSITION_PCT or fund the account",
+                    )
+                self.log.info("%s: entry skipped — notional %.2f < min %.2f",
+                              symbol, order_value, self.settings.crypto_min_notional)
+                return running_exposure
             # Hard buying-power backstop (the exposure cap is vs equity; a cash account's BP
             # can be lower once mostly invested).
-            order_value = risk.qty * price
             if buying_power is not None and order_value > buying_power:
                 self.log.warning("%s: entry blocked — order %.0f exceeds buying power %.0f",
                                   symbol, order_value, buying_power)
@@ -348,10 +405,10 @@ class TradingBot:
             running_exposure += self._enter(symbol, risk.qty, decision, bar_ts, ref, price)
 
         elif decision.signal is SignalType.EXIT_LONG and held > 0:
-            self._exit(symbol, held, decision, bar_ts, (pos_by_symbol or {}).get(symbol))
+            self._exit(symbol, held, decision, bar_ts, (pos_by_symbol or {}).get(self._norm(symbol)))
             # Free the value we SEEDED for this symbol (market_value basis), not a bar-close
             # estimate, so the tally returns to its true post-exit level.
-            running_exposure -= (position_mv or {}).get(symbol, held * decision.price)
+            running_exposure -= (position_mv or {}).get(self._norm(symbol), held * decision.price)
 
         return running_exposure
 
@@ -369,14 +426,7 @@ class TradingBot:
             if not retry and self.ledger.already_submitted(coid):
                 return 0.0  # already acted on this exact bar — idempotent
             self.ledger.record_intent(coid, symbol, "buy", qty, decision.reason)
-            # A marketable LIMIT needs a whole-share qty (Alpaca rejects a fractional limit with
-            # 422); a fractional qty (allow_fractional) must go as a market order or it never
-            # trades. Anchor the limit on the live price only when qty is whole.
-            if ref and float(qty).is_integer():
-                limit = round(ref * (1 + self.settings.slippage_cap_pct), 2)
-                order = self.broker.submit_limit(symbol, qty, OrderSide.BUY, limit, client_order_id=coid)
-            else:
-                order = self.broker.submit_market(symbol, qty, OrderSide.BUY, client_order_id=coid)
+            order = self._submit_order(symbol, qty, OrderSide.BUY, coid, ref=ref)
             self.ledger.mark_submitted(coid, str(order.id))
         filled, status = self._await_fill(coid)
         self.log.info("%s: BUY %s/%s filled (coid=%s)", symbol, filled, qty, coid)
@@ -408,7 +458,7 @@ class TradingBot:
             if not retry and self.ledger.already_submitted(coid):
                 return  # idempotent: don't sell twice for the same bar
             self.ledger.record_intent(coid, symbol, "sell", held, decision.reason)
-            order = self.broker.submit_market(symbol, held, OrderSide.SELL, client_order_id=coid)
+            order = self._submit_order(symbol, held, OrderSide.SELL, coid)
             self.ledger.mark_submitted(coid, str(order.id))
         filled, status = self._await_fill(coid)
         self.log.info("%s: EXIT sell qty=%s (coid=%s)", symbol, held, coid)
@@ -502,12 +552,78 @@ class TradingBot:
             return TrendMomentumStrategy(
                 TrendMomentumParams(enter_on_regime=self.settings.trend_enter_on_regime)
             )
+        if self.settings.strategy == "breakout":
+            return BreakoutStrategy(
+                BreakoutParams(
+                    entry_lookback=self.settings.breakout_entry_lookback,
+                    exit_lookback=self.settings.breakout_exit_lookback,
+                )
+            )
         return make_strategy(self.settings.strategy)
+
+    # --- market-mode routing (stock vs crypto) -----------------------------
+    @staticmethod
+    def _norm(symbol: str) -> str:
+        """Canonical key for matching broker symbols to managed symbols, tolerant of crypto
+        slash formatting ('BTC/USD' vs 'BTCUSD'). Identity for plain stock tickers, so the
+        well-tested stock path is unchanged."""
+        return symbol.replace("/", "").upper()
+
+    def _live_position_qty(self, symbol: str) -> float:
+        """Live held qty for a symbol. Stocks match exactly; crypto matches slash-insensitively
+        ('BTC/USD' vs 'BTCUSD') so a format mismatch can't make a held position look flat."""
+        if not self.is_crypto:
+            return self.broker.position_qty(symbol)
+        target = self._norm(symbol)
+        return sum(v for k, v in self.broker.positions().items() if self._norm(k) == target)
+
+    def _market_open(self) -> bool:
+        """Crypto trades 24/7; equities use the broker clock."""
+        return True if self.is_crypto else self.broker.is_market_open()
+
+    def _crypto_lookback_days(self) -> int:
+        """Calendar days of crypto history to request. Crypto bars are continuous (24/7), so on a
+        daily/weekly timeframe days ~= bars: request the warmup need + a pad. Intraday packs many
+        bars per day, so a short window already yields plenty."""
+        need = max(self.strategy.params.min_bars, 60)
+        tf = self.settings.timeframe.lower()
+        daily_or_slower = "day" in tf or "week" in tf or "month" in tf
+        return (need + 30) if daily_or_slower else 30
+
+    def _get_bars(self, symbol: str):
+        """Route bar fetching by asset class."""
+        if self.is_crypto:
+            return self.data.get_crypto_bars(
+                symbol, self.timeframe, lookback_days=self._crypto_lookback_days()
+            )
+        return self.data.get_bars(symbol, self.timeframe, lookback_days=800, use_cache=False)
+
+    def _ref_price(self, symbol: str) -> float | None:
+        """Live reference price for sizing / limit anchoring, routed by asset class. None on error."""
+        try:
+            return self.data.crypto_price(symbol) if self.is_crypto else self.data.latest_price(symbol)
+        except Exception:
+            return None
+
+    def _submit_order(self, symbol: str, qty: float, side: OrderSide, coid: str, ref=None):
+        """Submit one order, routed by asset class. Crypto -> market GTC (fractional). Stock -> a
+        marketable LIMIT BUY (bounds slippage) when a live ref and a WHOLE qty are available, else
+        a market order. Exits stay market for guaranteed liquidation."""
+        if self.is_crypto:
+            return self.broker.submit_crypto_market(symbol, qty, side, client_order_id=coid)
+        # A marketable LIMIT needs a whole-share qty (Alpaca rejects a fractional limit with 422);
+        # a fractional qty must go as a market order or it never trades. Limit is BUY-side only.
+        if side is OrderSide.BUY and ref and float(qty).is_integer():
+            limit = round(ref * (1 + self.settings.slippage_cap_pct), 2)
+            return self.broker.submit_limit(symbol, qty, side, limit, client_order_id=coid)
+        return self.broker.submit_market(symbol, qty, side, client_order_id=coid)
 
     def _market_regime_ok(self) -> bool:
         """True if the broad market is in an uptrend (price > long SMA). Gates NEW longs
         only; fail-open on error/short history (the kill switch is the real safety net)."""
-        if not self.settings.use_market_regime_filter:
+        # The SPY regime gate is equities-specific (and get_bars can't fetch a crypto symbol);
+        # for crypto the breakout's channel exit is the risk control, so don't gate entries.
+        if self.is_crypto or not self.settings.use_market_regime_filter:
             return True
         try:
             df = self.data.get_bars(
@@ -589,7 +705,7 @@ class TradingBot:
         The update + flatten run under the lock, mutually exclusive with entry submission."""
         try:
             self._write_heartbeat()  # refresh liveness even if step() is slow/wedged
-            if not self.broker.is_market_open():
+            if not self._market_open():
                 return
             equity = self.broker.account().equity  # network read, outside the lock
             # Roll day/week/month anchors first — safety_poll usually fires before step() on a
@@ -635,9 +751,12 @@ class TradingBot:
 
     @staticmethod
     def _coid(symbol: str, side: str, bar_ts) -> str:
-        """Deterministic client_order_id: same symbol+side+bar => same id, so a retry
-        of the same logical decision cannot create a duplicate order."""
-        digest = hashlib.sha1(f"{symbol}|{side}|{bar_ts}".encode()).hexdigest()[:24]
+        """Deterministic client_order_id: same symbol+side+bar => same id, so a retry of the
+        same logical decision cannot create a duplicate order. The symbol is normalized
+        (slash-stripped, upper-cased — same rule as _norm) so the id is independent of crypto
+        config formatting ('BTC/USD' vs 'BTCUSD'); identity for plain stock tickers."""
+        norm = symbol.replace("/", "").upper()
+        digest = hashlib.sha1(f"{norm}|{side}|{bar_ts}".encode()).hexdigest()[:24]
         return f"bot-{digest}"
 
     def _retry_coid(self, symbol: str, side: str, bar_ts) -> tuple[str, bool]:
@@ -658,7 +777,8 @@ class TradingBot:
         # previous retry is still resting on the book (mirror the catastrophic-stop guard).
         try:
             working = any(
-                o.symbol == symbol and _order_side(o) == side for o in self.broker.open_orders()
+                self._norm(o.symbol) == self._norm(symbol) and _order_side(o) == side
+                for o in self.broker.open_orders()
             )
         except Exception:
             working = True  # can't confirm -> don't risk stacking a second live order this cycle

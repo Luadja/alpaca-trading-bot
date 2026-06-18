@@ -81,6 +81,7 @@ def _bot(broker, ledger=None, halted=False):
     bot.risk = types.SimpleNamespace(halted=halted)
     bot._lock = threading.RLock()
     bot.log = LOG
+    bot.is_crypto = False  # stock-path tests; crypto routing is exercised separately
     return bot
 
 

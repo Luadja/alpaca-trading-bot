@@ -186,10 +186,14 @@ class Broker:
 
     def submit_crypto_limit(self, symbol: str, qty: float, side: OrderSide, limit_price: float,
                             client_order_id: str | None = None):
-        """Crypto limit order (GTC, fractional qty)."""
+        """Crypto limit order (GTC, fractional qty). NOTE: not currently on the live path (the
+        bot submits crypto as market GTC); kept for completeness. Rounds the limit adaptively —
+        2dp for >=$1 pairs, more decimals for sub-dollar pairs — so a low-priced coin isn't
+        mis-priced by 2dp rounding."""
         coid = client_order_id or self.new_client_order_id()
+        px = round(limit_price, 2) if limit_price >= 1.0 else round(limit_price, 6)
         req = LimitOrderRequest(
-            symbol=symbol, qty=qty, side=side, limit_price=round(limit_price, 2),
+            symbol=symbol, qty=qty, side=side, limit_price=px,
             time_in_force=TimeInForce.GTC, client_order_id=coid,
         )
         return self._submit(req, coid)

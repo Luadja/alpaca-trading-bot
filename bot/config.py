@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,9 +36,19 @@ class Settings(BaseSettings):
     )
     timeframe: str = Field(default="1Day", validation_alias="BOT_TIMEFRAME")
 
-    # Which strategy the live bot trades: "trend_momentum" (validated default) or
-    # "stoch_rsi_mfi" (retired mean-reversion — kept for comparison).
+    # Asset class: "stock" (equities, market-hours gated, TIF=DAY) or "crypto" (24/7, spot,
+    # TIF=GTC, fractional, no market-regime gate). Crypto routes data through the crypto bars
+    # endpoint and orders through GTC. Symbols look like "BTC/USD". Default stock.
+    market: str = Field(default="stock", validation_alias="BOT_MARKET")
+
+    # Which strategy the live bot trades: "trend_momentum" (validated default), "breakout"
+    # (crypto Donchian momentum — NO demonstrated edge, paper playground only), or
+    # "stoch_rsi_mfi"/"mean_reversion" (retired — kept for comparison).
     strategy: str = Field(default="trend_momentum", validation_alias="BOT_STRATEGY")
+
+    # Breakout (crypto momentum) params — Donchian channel lookbacks. See bot/strategy/breakout.py.
+    breakout_entry_lookback: int = Field(default=20, validation_alias="BOT_BREAKOUT_ENTRY_LB")
+    breakout_exit_lookback: int = Field(default=5, validation_alias="BOT_BREAKOUT_EXIT_LB")
 
     # Market-regime gate: block new longs when SPY is below its long SMA (Faber-style
     # drawdown reducer). Conservative — only prevents entries, never adds risk. Default on.
@@ -58,6 +68,25 @@ class Settings(BaseSettings):
     # Trailing peak-to-trough kill switch (0 = off): halt when equity falls this far below its
     # high-water mark, on top of the calendar daily/weekly/monthly stops.
     max_drawdown_from_peak_pct: float = Field(default=0.0, validation_alias="BOT_MAX_DRAWDOWN_PCT")
+
+    # Risk sizing knobs (otherwise RiskConfig defaults). max_position_pct caps any single
+    # position vs equity; catastrophic_stop_pct is the HARD disaster-flatten distance. Crypto
+    # is far more volatile than equities, so its profile widens the catastrophic stop (a 10%
+    # intraday move is routine) and lets the channel exit be the primary risk control.
+    max_position_pct: float = Field(default=0.10, validation_alias="BOT_MAX_POSITION_PCT")
+    catastrophic_stop_pct: float = Field(default=0.10, validation_alias="BOT_CATASTROPHIC_STOP_PCT")
+
+    # Calendar kill-switch thresholds (vs day/week/month-start equity). Stock defaults are
+    # tight (a 3% daily account move is a bad equities day); crypto routinely swings >3%
+    # intraday, so for market=crypto these auto-widen (see _crypto_risk_defaults) UNLESS the
+    # user overrides them, otherwise the daily latch would halt the bot nearly every day and
+    # pre-empt the channel exit / catastrophic stop that are meant to be the primary controls.
+    max_daily_loss_pct: float = Field(default=0.03, validation_alias="BOT_MAX_DAILY_LOSS_PCT")
+    max_weekly_loss_pct: float = Field(default=0.06, validation_alias="BOT_MAX_WEEKLY_LOSS_PCT")
+    max_monthly_loss_pct: float = Field(default=0.10, validation_alias="BOT_MAX_MONTHLY_LOSS_PCT")
+    # Skip (and alert once) a crypto entry whose notional would fall below this — avoids
+    # hammering Alpaca's crypto minimum with dust orders that 422-reject every bar.
+    crypto_min_notional: float = Field(default=1.0, validation_alias="BOT_CRYPTO_MIN_NOTIONAL")
 
     # Trend strategy: enter when already in an uptrend (fast>slow) on startup, not only on a
     # fresh golden cross. Off by default — changes signal counts, so validate first.
@@ -99,7 +128,19 @@ class Settings(BaseSettings):
         cleaned = [s.strip().upper() for s in v if s and s.strip()]
         if not cleaned:
             raise ValueError("BOT_SYMBOLS must list at least one symbol")
+        # Reject symbols that collapse to the same canonical key (slash-stripped), e.g.
+        # 'BTC/USD' and 'BTCUSD' — they'd silently collide in the bot's position/order maps.
+        if len({s.replace("/", "") for s in cleaned}) != len(cleaned):
+            raise ValueError("BOT_SYMBOLS has duplicates after normalization (e.g. 'BTC/USD' and 'BTCUSD')")
         return cleaned
+
+    @field_validator("market")
+    @classmethod
+    def _market_known(cls, v: str) -> str:
+        mv = v.strip().lower()
+        if mv not in {"stock", "crypto"}:
+            raise ValueError("BOT_MARKET must be 'stock' or 'crypto'")
+        return mv
 
     @field_validator("feed")
     @classmethod
@@ -127,6 +168,24 @@ class Settings(BaseSettings):
         if not 0 < v < 0.1:  # negative would price the buy below market (never fills); >10% is absurd
             raise ValueError("BOT_SLIPPAGE_CAP_PCT must be between 0 and 0.1")
         return v
+
+    @model_validator(mode="after")
+    def _crypto_risk_defaults(self):
+        """For market=crypto, widen the kill-switch / catastrophic thresholds to crypto-scale
+        values — but ONLY where the user left the stock default, so an explicit override always
+        wins. Crypto routinely swings >3% intraday, so the stock 3% daily latch would otherwise
+        halt the bot nearly every day and pre-empt the channel exit / catastrophic stop."""
+        if self.market != "crypto":
+            return self
+        for field, (stock_default, crypto_default) in {
+            "max_daily_loss_pct": (0.03, 0.15),
+            "max_weekly_loss_pct": (0.06, 0.30),
+            "max_monthly_loss_pct": (0.10, 0.50),
+            "catastrophic_stop_pct": (0.10, 0.25),
+        }.items():
+            if getattr(self, field) == stock_default:  # untouched stock default -> widen
+                setattr(self, field, crypto_default)
+        return self
 
     def assert_keys(self) -> None:
         if not self.api_key or not self.api_secret:
