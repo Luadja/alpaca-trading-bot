@@ -92,11 +92,11 @@ trailing + time exits. New broker methods: `submit_bracket()`, OCO/leg handling,
 1. **Timeframe** — daily (recommended start) vs intraday?  → **CHOSEN: intraday (1H/15min)**
 2. **Strategy flavor** — mean-reversion / breakout / momentum?  → **CHOSEN: mean-reversion bounce**
 3. **Universe** — volatile stocks / leveraged ETFs / crypto?  → **CHOSEN: crypto**
-4. **Long-only vs add shorting?**  → **CHOSEN: long/short** ⚠️ *conflicts with crypto — see §6*
+4. **Long-only vs add shorting?**  → **RESOLVED: crypto LONG-ONLY** (Alpaca crypto is spot — no shorting; mean-reversion is long-biased anyway)
 
 ---
 
-## 6. Chosen direction: Crypto · Intraday · Mean-reversion · Long/Short
+## 6. Chosen direction: Crypto · Intraday · Mean-reversion · **Long-only**  ✅ locked
 This is the most ambitious combination — effectively a **new bot** that reuses the
 safety/ledger/alerting/infra but rewrites the data, market-clock, order, and run-loop layers.
 
@@ -104,11 +104,10 @@ safety/ledger/alerting/infra but rewrites the data, market-clock, order, and run
 Shorting on Alpaca is an **equities/margin** feature; crypto has no borrow/margin/short. So
 "crypto **and** shorting" cannot both be true on Alpaca. (Confirm against current Alpaca docs,
 but this has long been the case.) Resolve one way:
-- **(A) Crypto, LONG-ONLY** *(recommended)* — drop shorting. Mean-reversion is naturally
+- **(A) Crypto, LONG-ONLY** ✅ **CHOSEN** — drop shorting. Mean-reversion is naturally
   long-biased (buy oversold dips), so we lose little, and it's the simplest crypto path.
-- **(B) Stocks / leveraged-ETFs, LONG/SHORT** — keep shorting, drop crypto (back to
-  market-hours equities; can short overbought names on a margin account).
-- **(C) Crypto long + inverse-ETF "shorts"** — mixes 24/7 crypto with market-hours ETFs; messy, not recommended.
+- ~~(B) Stocks / leveraged-ETFs, LONG/SHORT~~ — not chosen.
+- ~~(C) Crypto long + inverse-ETF "shorts"~~ — not chosen (messy).
 
 ### Crypto-specific new plumbing (on top of §2)
 - **24/7 run loop** — remove the `is_market_open()` gating that early-returns when closed;
