@@ -174,6 +174,26 @@ class Broker:
         )
         return self._submit(req, coid)
 
+    def submit_crypto_market(self, symbol: str, qty: float, side: OrderSide,
+                             client_order_id: str | None = None):
+        """Crypto market order. Crypto requires GTC time-in-force (DAY is stock-only) and
+        supports fractional qty natively. Routes through the same idempotent _submit."""
+        coid = client_order_id or self.new_client_order_id()
+        req = MarketOrderRequest(
+            symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.GTC, client_order_id=coid
+        )
+        return self._submit(req, coid)
+
+    def submit_crypto_limit(self, symbol: str, qty: float, side: OrderSide, limit_price: float,
+                            client_order_id: str | None = None):
+        """Crypto limit order (GTC, fractional qty)."""
+        coid = client_order_id or self.new_client_order_id()
+        req = LimitOrderRequest(
+            symbol=symbol, qty=qty, side=side, limit_price=round(limit_price, 2),
+            time_in_force=TimeInForce.GTC, client_order_id=coid,
+        )
+        return self._submit(req, coid)
+
     def buy(self, symbol: str, qty: float, client_order_id: str | None = None):
         return self.submit_market(symbol, qty, OrderSide.BUY, client_order_id)
 
