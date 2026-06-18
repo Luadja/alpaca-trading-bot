@@ -17,8 +17,13 @@ from pathlib import Path
 
 import pandas as pd
 from alpaca.data.enums import Adjustment, DataFeed
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
+from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
+from alpaca.data.requests import (
+    CryptoBarsRequest,
+    CryptoLatestQuoteRequest,
+    StockBarsRequest,
+    StockLatestTradeRequest,
+)
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from bot.config import Settings
@@ -89,10 +94,43 @@ class HistoricalData:
     def __init__(self, settings: Settings, cache_dir: str = "data/cache") -> None:
         settings.assert_keys()
         self.client = StockHistoricalDataClient(settings.api_key, settings.api_secret)
+        # Crypto data is a separate endpoint: real-time, free, no SIP/feed concept, trades 24/7.
+        self.crypto_client = CryptoHistoricalDataClient(settings.api_key, settings.api_secret)
         self.feed = _feed(settings.feed)
         self._anchor_feed = self.feed if self.feed in (DataFeed.IEX, DataFeed.SIP) else DataFeed.IEX
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_crypto_bars(self, symbol: str, timeframe: TimeFrame, lookback_days: int = 30,
+                        drop_forming: bool = True) -> pd.DataFrame:
+        """Intraday crypto bars (24/7). No SIP feed / 15-min rule / trading-day calendar — the
+        crypto data endpoint is real-time and free. ``drop_forming`` removes the trailing,
+        still-forming bar so live signals never read a half-baked candle (look-ahead guard)."""
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=lookback_days)
+        req = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=timeframe, start=start, end=end)
+        df = self.crypto_client.get_crypto_bars(req).df
+        if df.empty:
+            return df
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level="symbol")
+        df = df[["open", "high", "low", "close", "volume"]].sort_index()
+        if drop_forming and len(df) > 1:
+            df = df.iloc[:-1]  # drop the current, still-forming bar
+        return df
+
+    def crypto_price(self, symbol: str) -> float | None:
+        """Live crypto mid price (from the latest quote) for sizing/marketable limits; None on
+        any error so the caller can fall back to a market order. Crypto quotes are real-time."""
+        try:
+            req = CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
+            q = self.crypto_client.get_crypto_latest_quote(req)[symbol]
+            bid, ask = float(q.bid_price or 0), float(q.ask_price or 0)
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2.0
+            return ask or bid or None
+        except Exception:
+            return None
 
     def latest_price(self, symbol: str) -> float | None:
         """Most recent trade price for anchoring marketable limits; None on any error, a
