@@ -167,6 +167,25 @@ def test_watchdog_flattens_after_grace_elapses(tmp_path):
     assert fired is True and broker.flattened == 1
 
 
+def test_watchdog_crypto_armed_when_stock_market_closed(tmp_path):
+    # Crypto trades 24/7: even though the STOCK clock says closed, a stale heartbeat must still
+    # flatten — otherwise the dead-man's switch would be off nights/weekends for a crypto bot.
+    p = str(tmp_path / "hb.json")
+    broker = _Broker(is_open=False)
+    _write_stale(p)
+    fired = check_once(broker, _Alerter(), p, 180, LOG, already_fired=False, is_crypto=True)
+    assert fired is True and broker.flattened == 1
+
+
+def test_watchdog_stock_mode_defers_when_market_closed(tmp_path):
+    # Sanity: STOCK mode preserves the existing 'don't act outside market hours' behavior.
+    p = str(tmp_path / "hb.json")
+    broker = _Broker(is_open=False)
+    _write_stale(p)
+    fired = check_once(broker, _Alerter(), p, 180, LOG, already_fired=False, is_crypto=False)
+    assert fired is False and broker.flattened == 0
+
+
 def test_watchdog_leftover_heartbeat_within_grace_no_flatten(tmp_path):
     # A heartbeat OLDER than the watchdog's own uptime is a prior-session leftover (the file
     # persists on disk), not the bot we just launched. Within the grace it must NOT flatten,

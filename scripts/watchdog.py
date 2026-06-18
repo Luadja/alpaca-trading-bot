@@ -43,7 +43,8 @@ def _await_flat(broker, log, timeout: float, poll: float) -> dict:
 
 def check_once(broker, alerter, heartbeat_path: str, max_age: float, log, *, already_fired: bool,
                confirm_timeout: float = 15.0, confirm_poll: float = 1.0,
-               startup_grace: float = 0.0, elapsed: float | None = None) -> bool:
+               startup_grace: float = 0.0, elapsed: float | None = None,
+               is_crypto: bool = False) -> bool:
     """One watchdog check. Returns the new 'already_fired' latch state.
 
     Flattens (once per staleness episode) when the market is open and the heartbeat is
@@ -51,19 +52,26 @@ def check_once(broker, alerter, heartbeat_path: str, max_age: float, log, *, alr
     is NOT set unless the account is confirmed flat (after a bounded poll for the async close
     fills) — so a failed/incomplete flatten retries next tick.
 
+    Crypto trades 24/7, so ``is_crypto`` makes the market always 'open' — otherwise the
+    dead-man's-switch would be disabled nights/weekends (the stock clock), exactly when a
+    crashed crypto bot would carry exposure through 24/7 markets.
+
     Startup grace: a MISSING heartbeat within ``startup_grace`` seconds of launch (``elapsed``)
     is treated as not-yet-stale — the bot may simply not have written its first heartbeat yet,
     and flattening then would liquidate a healthy account at cold start. An EXISTING-but-old
     heartbeat is always immediately stale (a genuine crash), regardless of grace.
     """
-    try:
-        market_open = broker.is_market_open()
-    except Exception:
-        # Don't fail open: a broker outage is exactly when the bot may be dead. We can't
-        # flatten without the API either, but surface the degradation instead of silence.
-        log.exception("watchdog: cannot read market state")
-        alerter.notify("critical", "watchdog DEGRADED — cannot reach broker", "market-state check failed")
-        return already_fired
+    if is_crypto:
+        market_open = True  # 24/7 — the dead-man's switch must be armed at all times
+    else:
+        try:
+            market_open = broker.is_market_open()
+        except Exception:
+            # Don't fail open: a broker outage is exactly when the bot may be dead. We can't
+            # flatten without the API either, but surface the degradation instead of silence.
+            log.exception("watchdog: cannot read market state")
+            alerter.notify("critical", "watchdog DEGRADED — cannot reach broker", "market-state check failed")
+            return already_fired
 
     if not market_open:
         return already_fired  # don't act outside market hours
@@ -138,9 +146,10 @@ def main() -> None:
 
     broker = Broker(settings)
     alerter = alerter_from_settings(settings)
+    is_crypto = settings.market == "crypto"
     start = time.monotonic()
-    log.info("Watchdog started: max-age=%.0fs interval=%.0fs startup-grace=%.0fs path=%s",
-             args.max_age, args.interval, startup_grace, settings.heartbeat_path)
+    log.info("Watchdog started: max-age=%.0fs interval=%.0fs startup-grace=%.0fs market=%s path=%s",
+             args.max_age, args.interval, startup_grace, settings.market, settings.heartbeat_path)
 
     fired = False
     overnight_alerted = False
@@ -148,11 +157,12 @@ def main() -> None:
         try:
             fired = check_once(broker, alerter, settings.heartbeat_path, args.max_age, log,
                                already_fired=fired, startup_grace=startup_grace,
-                               elapsed=time.monotonic() - start)
+                               elapsed=time.monotonic() - start, is_crypto=is_crypto)
             # A bot that died with positions open into/after the close can't be flattened by a
             # market-closed watchdog (DAY closes won't fill until the next open). Surface it once
-            # so a human can act, instead of silently carrying the position overnight.
-            if not broker.is_market_open():
+            # so a human can act, instead of silently carrying the position overnight. Crypto is
+            # 24/7 — never "closed" — so this stock-only path is skipped (check_once flattens).
+            if not is_crypto and not broker.is_market_open():
                 hb = read_heartbeat(settings.heartbeat_path)
                 age = heartbeat_age_seconds(hb) if hb else None
                 stale = hb is None or age is None or age > args.max_age or age < -args.max_age
